@@ -1,3 +1,7 @@
+Нужно одно уточнение: весь код делал не я, а ИИ One clarification: I didn't write all the code—AI did.
+
+
+
 # Setup
 
 ## Requirements
