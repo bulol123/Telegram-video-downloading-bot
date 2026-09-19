@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 # === ОТЛАДКА ===
 telebot.logger.setLevel(logging.DEBUG)
 
-TOKEN = os.environ.get('BOT_TOKEN', '[TOKEN]')
+TOKEN = '[TOKEN]'
 
 bot = telebot.TeleBot(TOKEN)
 
