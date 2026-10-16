@@ -9,10 +9,15 @@ import threading
 import subprocess
 import uuid
 import glob
+import shutil
+import socket
+import select
+import ipaddress
+from urllib.parse import urlparse, urljoin
 import queue
 import contextlib
 import datetime
-from collections import deque
+from collections import deque, OrderedDict
 from urllib.parse import quote
 
 import requests
@@ -20,18 +25,8 @@ import telebot
 import yt_dlp
 from telebot import apihelper
 from telebot.types import (InlineKeyboardMarkup, InlineKeyboardButton,
-                           InlineQueryResultArticle, InputTextMessageContent)
-# ddgs (поиск по DuckDuckGo) — по вашим же словам, не дал нужного результата
-# для фильтра по периоду (у DDG нет произвольных диапазонов дат, только
-# пресеты день/неделя/месяц/год), но код всё ещё пытается его использовать
-# как первый вариант в yt_search_with_period. Делаем импорт необязательным,
-# как остальные опциональные зависимости в этом файле, — раньше отсутствие
-# пакета ddgs роняло бота целиком ещё на старте, до входа в какой-либо код.
-try:
-    from ddgs import DDGS
-    HAS_DDGS = True
-except ImportError:
-    HAS_DDGS = False
+                           InlineQueryResultArticle, InputTextMessageContent,
+                           InputMediaPhoto)
 
 
 # youtube-transcript-api — отдельная, специализированная библиотека для
@@ -85,16 +80,113 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# === ОТЛАДКА ===
-telebot.logger.setLevel(logging.DEBUG)
+TOKEN = os.environ.get('BOT_TOKEN') or '(TOKEN)'
 
-TOKEN = '[TOKEN]'
+# ---------- БЕЗОПАСНОСТЬ: ТОКЕН НИКОГДА НЕ ПОПАДАЕТ В ЛОГИ И В ЧАТ ----------
+# Токен входит в URL каждого запроса к Bot API, а ошибки requests и
+# DEBUG-лог telebot печатают URL целиком. Поэтому всё, что уходит в логи
+# и в сообщения бота, прогоняется через redact().
+_TOKEN_RE = re.compile(r'bot\d{6,}:[A-Za-z0-9_-]{30,}')
+
+def redact(text):
+    s = str(text)
+    if TOKEN and TOKEN != '(TOKEN)':
+        s = s.replace(TOKEN, '<TOKEN>')
+    return _TOKEN_RE.sub('bot<TOKEN>', s)
+
+
+# Тексты ошибок, уходящие в чат, не должны раскрывать пути на диске, адреса,
+# IP и хвосты stderr ffmpeg. Всё, что из except идёт пользователю, — через
+# public_error(); подробности остаются только в логе.
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+_URL_IN_TEXT_RE = re.compile(r'https?://\S+', re.I)
+_WIN_PATH_RE = re.compile(r'[A-Za-z]:[\\/][^\s\'"<>|]*')
+_UNIX_PATH_RE = re.compile(r'(?<![\w:/.\-])/(?:[\w.\-~]+/)+[\w.\-~]*')
+_IPV4_RE = re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b')
+
+def public_error(e, limit=300):
+    s = redact(_ANSI_RE.sub('', str(e)))
+    for base in (_BASE_DIR, os.path.abspath(DOWNLOAD_DIR)):
+        if base:
+            s = s.replace(base, '<dir>')
+    for sep in (os.sep, '/'):
+        s = s.replace(DOWNLOAD_DIR + sep, '<dir>/')
+    s = re.sub(r"<dir>[\\/][^\s'\"]*", '<путь>', s)     # каталог загрузок + имя файла
+    s = _URL_IN_TEXT_RE.sub('<ссылка>', s)
+    s = _WIN_PATH_RE.sub('<путь>', s)
+    s = _UNIX_PATH_RE.sub('<путь>', s)
+    s = _IPV4_RE.sub('<ip>', s)
+    s = ' '.join(s.split())
+    return s if len(s) <= limit else s[:limit - 1] + '…'
+
+class _RedactingFormatter(logging.Formatter):
+    def format(self, record):
+        return redact(super().format(record))
+
+for _lg in (logging.getLogger(), telebot.logger):
+    for _h in _lg.handlers:
+        _old = _h.formatter
+        _h.setFormatter(_RedactingFormatter(getattr(_old, '_fmt', None),
+                                            getattr(_old, 'datefmt', None)))
+
+# Подробный лог telebot — только по явному запросу: BOT_DEBUG=1
+telebot.logger.setLevel(logging.DEBUG if os.environ.get('BOT_DEBUG') == '1'
+                        else logging.INFO)
+
+# Проверка TLS-сертификатов ВКЛЮЧЕНА. Если вы за DPI-перехватом, который
+# подменяет сертификаты, запускайте с INSECURE_TLS=1 (на свой риск:
+# трафик можно подменить/прочитать по пути).
+INSECURE_TLS = os.environ.get('INSECURE_TLS') == '1'
+if INSECURE_TLS:
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+YOUTUBE_API_KEY = ''  # опционально: ключ YouTube Data API v3 (console.cloud.google.com) — для точного поиска по периоду. Без него используется бесплатный способ (см. yt_search_with_period).
 
 bot = telebot.TeleBot(TOKEN)
 
+def _redact_outgoing(method_name):
+    """Тексты, уходящие пользователям (в т.ч. тексты исключений), чистим от токена."""
+    orig = getattr(bot, method_name)
+    def wrapper(*args, **kwargs):
+        args = tuple(redact(a) if isinstance(a, str) else a for a in args)
+        kwargs = {k: (redact(v) if isinstance(v, str) else v) for k, v in kwargs.items()}
+        return orig(*args, **kwargs)
+    setattr(bot, method_name, wrapper)
+
+# Токен вычищается из ВСЕХ исходящих текстов: сообщения, подписи к медиа и ответы на кнопки.
+for _m in ('send_message', 'edit_message_text', 'reply_to', 'edit_message_caption',
+           'send_photo', 'send_video', 'send_audio', 'send_voice', 'send_document',
+           'answer_callback_query'):
+    _redact_outgoing(_m)
+
 DOWNLOAD_DIR = 'downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-user_data = {}
+
+# Контекст потока: кто сейчас «действует» (нужен, чтобы карточки с кнопками
+# запоминали владельца — того, кто запросил видео).
+_tls = threading.local()
+
+class BoundedDict(OrderedDict):
+    """dict с потолком размера: старые записи вытесняются, память не растёт вечно."""
+    def __init__(self, maxlen=1000):
+        super().__init__()
+        self.maxlen = maxlen
+    def __setitem__(self, key, value):
+        if isinstance(value, dict) and 'owner' not in value:
+            _o = getattr(_tls, 'owner', None)
+            if _o is not None:
+                value['owner'] = _o
+        super().__setitem__(key, value)
+        while len(self) > self.maxlen:
+            try:
+                self.popitem(last=False)
+            except KeyError:
+                break
+
+user_data = BoundedDict(1000)
 
 # ================================================================
 #  ЗАЩИТА ОТ ФЛУДА/ДДОСА
@@ -111,31 +203,57 @@ user_data = {}
 #    работает и в группах, так как считается по chat_id, а не по юзеру.
 MAX_CONCURRENT_JOBS = 2
 MAX_QUEUE_SIZE = 25
+# Сколько задач (в очереди + выполняются) может держать ОДИН пользователь —
+# иначе один человек занимает все 25 слотов и блокирует остальных.
+MAX_JOBS_PER_USER = int(os.environ.get('MAX_JOBS_PER_USER') or 3)
 COOLDOWN_SEC = 3
 RATE_WINDOW_SEC = 60
 RATE_MAX_REQUESTS = 8
 
 job_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
 
+_owner_jobs = {}
+_owner_jobs_lock = threading.Lock()
+
+def _owner_release(owner):
+    if owner is None:
+        return
+    with _owner_jobs_lock:
+        n = _owner_jobs.get(owner, 0) - 1
+        if n > 0:
+            _owner_jobs[owner] = n
+        else:
+            _owner_jobs.pop(owner, None)
+
 def _job_worker():
     while True:
-        func, args = job_queue.get()
+        func, args, owner = job_queue.get()
+        _tls.owner = owner
         try:
             func(*args)
         except Exception as e:
             logger.error("Необработанная ошибка в фоновой задаче: %s", e)
         finally:
+            _tls.owner = None
+            _owner_release(owner)
             job_queue.task_done()
 
 for _ in range(MAX_CONCURRENT_JOBS):
     threading.Thread(target=_job_worker, daemon=True).start()
 
-def enqueue_job(func, *args):
-    """Пытается поставить задачу в очередь. False, если очередь забита."""
+def enqueue_job(func, *args, owner=None):
+    """Пытается поставить задачу в очередь. False, если очередь забита или
+    у этого пользователя уже максимум задач (MAX_JOBS_PER_USER)."""
+    if owner is not None:
+        with _owner_jobs_lock:
+            if _owner_jobs.get(owner, 0) >= MAX_JOBS_PER_USER:
+                return False
+            _owner_jobs[owner] = _owner_jobs.get(owner, 0) + 1
     try:
-        job_queue.put_nowait((func, args))
+        job_queue.put_nowait((func, args, owner))
         return True
     except queue.Full:
+        _owner_release(owner)
         return False
 
 _active_jobs = set()
@@ -164,11 +282,74 @@ def rate_limited(chat_id):
         if now - last < COOLDOWN_SEC:
             return True
         _last_request[chat_id] = now
+        if len(_last_request) > 5000:   # не даём словарям расти бесконечно
+            cutoff = now - RATE_WINDOW_SEC
+            for cid in [c for c, t in _last_request.items() if t < cutoff]:
+                _last_request.pop(cid, None)
+                _rate_history.pop(cid, None)
         hist = _rate_history.setdefault(chat_id, deque())
         hist.append(now)
         while hist and now - hist[0] > RATE_WINDOW_SEC:
             hist.popleft()
         return len(hist) > RATE_MAX_REQUESTS
+
+class _SimpleLimiter:
+    """Скользящее окно + минимальный интервал между событиями по ключу.
+    Память ограничена (LRU по ключам), поэтому ключи можно брать из внешнего
+    мира (user_id) — словарь не раздувается."""
+    def __init__(self, cooldown, window, max_events, max_keys=5000):
+        self.cooldown = cooldown
+        self.window = window
+        self.max_events = max_events
+        self.max_keys = max_keys
+        self._hist = OrderedDict()
+        self._lock = threading.Lock()
+
+    def hit(self, key):
+        """True — событие надо отклонить (слишком часто)."""
+        now = time.time()
+        with self._lock:
+            hist = self._hist.get(key)
+            if hist is None:
+                hist = deque()
+                self._hist[key] = hist
+                while len(self._hist) > self.max_keys:
+                    self._hist.popitem(last=False)
+            else:
+                self._hist.move_to_end(key)
+            while hist and now - hist[0] > self.window:
+                hist.popleft()
+            if hist and now - hist[-1] < self.cooldown:
+                return True
+            hist.append(now)
+            return len(hist) > self.max_events
+
+
+# Лимиты по ПОЛЬЗОВАТЕЛЮ для всего, что раньше не ограничивалось вообще:
+_cb_limiter = _SimpleLimiter(cooldown=0.4, window=60, max_events=60)      # нажатия кнопок
+_search_limiter = _SimpleLimiter(cooldown=4, window=60, max_events=8)     # поиск YouTube
+_inline_limiter = _SimpleLimiter(cooldown=0.5, window=60, max_events=40)  # inline-запросы
+
+# Кнопки карточки может нажимать только тот, кто её запросил (актуально в группах).
+RESTRICT_BUTTONS_TO_OWNER = True
+
+
+def uid_of(obj):
+    """id пользователя у message/call/inline_query (None, если его нет)."""
+    return getattr(getattr(obj, 'from_user', None), 'id', None)
+
+
+def owner_denied(call, data):
+    """True — кнопку нажал не тот, кто запросил карточку; ответ уже отправлен."""
+    if not RESTRICT_BUTTONS_TO_OWNER or not isinstance(data, dict):
+        return False
+    owner = data.get('owner')
+    if owner is None or uid_of(call) == owner:
+        return False
+    safe_answer_callback(call, "🔒 Эти кнопки доступны только тому, кто запросил видео.",
+                         show_alert=True)
+    return True
+
 
 def safe_answer_callback(call, text=None, show_alert=False):
     """answer_callback_query может упасть, если на этот же callback уже
@@ -196,10 +377,10 @@ def dispatch_download(call, data, video_id, choice, func, *extra_args):
         finally:
             finish_job(job_key)
 
-    if not enqueue_job(_run):
+    if not enqueue_job(_run, owner=uid_of(call)):
         finish_job(job_key)
-        safe_answer_callback(call, "🚦 Бот сейчас перегружен запросами, попробуйте через минуту.",
-                             show_alert=True)
+        safe_answer_callback(call, "🚦 Бот перегружен или у вас уже запущено максимум задач. "
+                                   "Попробуйте через минуту.", show_alert=True)
         return
 
     if job_queue.qsize() > 0:
@@ -213,6 +394,10 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FFMPEG_BIN = os.path.join(_BASE_DIR, 'ffmpeg.exe')
 if not os.path.exists(FFMPEG_BIN):
     FFMPEG_BIN = 'ffmpeg'
+# ffmpeg открывает входные файлы только по протоколу file: скачанный «видеофайл»
+# (SDP, HLS, concat и т.п.) не сможет заставить его ходить по сети или читать
+# через другие протоколы. Ставится ПЕРЕД каждым -i.
+FFMPEG_IN_GUARD = ['-protocol_whitelist', 'file']
 
 # ---------- КУКИ (для обхода PO-token / возрастных ограничений YouTube) ----------
 # Положите файл cookies.txt рядом со скриптом (экспортируется расширением
@@ -227,7 +412,12 @@ def cookies_opts():
 
 
 # ---------- САМОДИАГНОСТИКА БОТА ----------
-ADMIN_CHAT_ID = 1925781365
+# ID чата администратора для notify_admin(). Берётся из переменной окружения
+# ADMIN_CHAT_ID; без неё уведомления выключены (раньше здесь был зашит чужой ID).
+try:
+    ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID') or 0)
+except ValueError:
+    ADMIN_CHAT_ID = 0
 
 def _send_raw(chat_id, text):
     """Отправляет сообщение напрямую по HTTP, пробуя сначала локальный
@@ -250,6 +440,8 @@ def _send_raw(chat_id, text):
         return False
 
 def notify_admin(text):
+    if not ADMIN_CHAT_ID:
+        return
     _send_raw(ADMIN_CHAT_ID, text)
 
 # ---------- СТАТУС БОТА — ЧЕРЕЗ ИМЯ, А НЕ РАССЫЛКУ ----------
@@ -259,6 +451,7 @@ def notify_admin(text):
 # "Скачивание видео🟢" — работает, "Скачивание видео🛑" — не работает.
 # Человек видит статус, просто открыв чат, без лишних пингов.
 BOT_BASE_NAME = "Скачивание видео"
+GITHUB_URL = "https://github.com/bulol123/Telegram-video-downloading-bot"
 _bot_name_status = {'ok': None}
 
 def _post_method(method, payload):
@@ -291,14 +484,15 @@ def set_bot_status_name(ok):
         logger.warning("setChatMenuButton не удался: %s", err)
 
     ok_r, err = _post_method('setMyShortDescription',
-                             {'short_description': f"Статус: {status}"})
+                             {'short_description': f"Статус: {status} • Код: {GITHUB_URL}"})
     if not ok_r:
         logger.warning("setMyShortDescription не удался: %s", err)
 
     ok_r, err = _post_method('setMyDescription',
                              {'description':
                               "Загрузчик видео/аудио (YouTube, TikTok и др.). "
-                              f"Статус: {status}."})
+                              f"Статус: {status}.\n\n"
+                              f"Исходный код: {GITHUB_URL}"})
     if not ok_r:
         logger.warning("setMyDescription не удался: %s", err)
 
@@ -480,6 +674,7 @@ def quality_label(key, q):
 
 # ---------- TIKTOK: КНОПКИ ----------
 TT_CHOICES = {
+    'tt_photos': ('photos', 'photos', 'TIKTOK PHOTOS'),
     'tt_video': ('video', 'video', 'TIKTOK'),
     'tt_hd':    ('hd',    'video', 'TIKTOK HD'),
     'tt_audio': ('music', 'audio', 'MP3'),
@@ -495,8 +690,595 @@ def playwright_proxy_server(proxy):
         return None
     return proxy.replace('socks5h://', 'socks5://')
 
+# ---------- БЕЗОПАСНОСТЬ ВХОДЯЩИХ ССЫЛОК ----------
+# Бот скачивает «всё что угодно», поэтому любой человек может подсунуть ссылку
+# не на видео, а на внутренний адрес вашего ПК/сети (localhost, роутер,
+# 192.168.x.x, метаданные облака 169.254.169.254, локальный Bot API :8081).
+# Такие ссылки отсекаем ДО обращения к yt-dlp/Playwright/requests.
+BLOCK_PRIVATE_URLS = True
+MAX_DOWNLOAD_BYTES = 2_000_000_000   # потолок одного файла (лимит Telegram — 2 ГБ)
+MAX_THUMB_BYTES = 10_000_000
+# Лимиты на содержимое (можно переопределить переменными окружения):
+MAX_VIDEO_DURATION_SEC = int(os.environ.get('MAX_VIDEO_DURATION_SEC') or 4 * 3600)
+MIN_FREE_DISK_BYTES = int(os.environ.get('MIN_FREE_DISK_BYTES') or 1_000_000_000)
+# Закрытые видео, которые видит только ваш аккаунт (cookies.txt): их бот не отдаёт.
+# 'needs_auth' сюда НЕ входит — так YouTube помечает возрастные ролики.
+PRIVATE_AVAILABILITY = {'private', 'subscriber_only', 'premium_only'}
+DNS_CHECK_TTL = 30                   # сек: кэш результата DNS-проверки хоста
+_dns_ok_cache = BoundedDict(2048)    # (host, port) -> (до_когда, публичный_ли)
+_NUMERIC_HOST_RE = re.compile(r'(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+))*')
+
+# 198.18.0.0/15 используют fake-ip режимы VPN (Clash/sing-box и т.п.) — не режем.
+_FAKE_IP_NET = ipaddress.ip_network('198.18.0.0/15')
+
+def _ip_is_public(ip):
+    if ip.version == 6 and ip.ipv4_mapped:      # ::ffff:127.0.0.1 и т.п.
+        ip = ip.ipv4_mapped
+    if ip in _FAKE_IP_NET:
+        return True
+    return not (not ip.is_global or ip.is_private or ip.is_loopback
+                or ip.is_link_local or ip.is_reserved or ip.is_multicast
+                or ip.is_unspecified)
+
+def is_public_http_url(url, resolve=True):
+    """True только для http(s)-адресов, указывающих на публичные IP.
+    resolve=False — не резолвить имя локально (когда DNS делает прокси);
+    IP-литералы и localhost-имена проверяются в любом случае."""
+    if not BLOCK_PRIVATE_URLS:
+        return True
+    try:
+        u = urlparse(url)
+        if u.scheme not in ('http', 'https') or not u.hostname:
+            return False
+        host = u.hostname.strip('[]').lower()
+        if host == 'localhost' or host.endswith('.localhost') or host.endswith('.local') \
+                or host.endswith('.internal'):
+            return False
+        port = u.port or (443 if u.scheme == 'https' else 80)
+        try:
+            ips = [ipaddress.ip_address(host.split('%')[0])]
+        except ValueError:
+            if _NUMERIC_HOST_RE.fullmatch(host):
+                return False        # 2130706433, 0x7f.1 и прочие экзотические записи IP
+            if not resolve:
+                return True
+            now = time.time()
+            hit = _dns_ok_cache.get((host, port))
+            if hit and hit[0] > now:
+                return hit[1]
+            infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+            if not infos:
+                return False
+            ips = [ipaddress.ip_address(i[4][0].split('%')[0]) for i in infos]
+            ok = all(_ip_is_public(ip) for ip in ips)
+            _dns_ok_cache[(host, port)] = (now + DNS_CHECK_TTL, ok)
+            return ok
+        return all(_ip_is_public(ip) for ip in ips)
+    except Exception:
+        return False
+
+# Наследуемся от DownloadCancelled, чтобы yt-dlp не проглатывал эти ошибки
+# при ignoreerrors=True (иначе отказ превратился бы в тихое «не скачалось»).
+_YDLCancel = getattr(yt_dlp.utils, 'DownloadCancelled', None)
+if _YDLCancel is None:
+    class _YDLCancel(Exception):
+        pass
+
+class UnsafeURLError(_YDLCancel):
+    pass
+
+class MediaRejectedError(_YDLCancel):
+    """Видео отклонено политикой бота (лайв, слишком длинное, закрытое, нет места)."""
+    pass
+
+_FATAL_ERRORS = (UnsafeURLError, MediaRejectedError)
+
+MAX_REDIRECTS = 5
+
+def safe_request(method, url, **kwargs):
+    """requests.request, но редиректы идут вручную и КАЖДЫЙ переход проверяется
+    через is_public_http_url — иначе внешний сервер может перенаправить бота
+    на localhost / локальный Bot API / адрес из вашей сети.
+    Остаточный риск: DNS-rebinding между проверкой и запросом (закрывается
+    только фиксацией IP или запуском бота в изолированной сети)."""
+    kwargs.pop('allow_redirects', None)
+    resolve = not kwargs.get('proxies')
+    cur = url
+    for _ in range(MAX_REDIRECTS + 1):
+        if not is_public_http_url(cur, resolve=resolve):
+            raise UnsafeURLError('адрес не публичный или недопустимый')
+        r = requests.request(method, cur, allow_redirects=False, **kwargs)
+        loc = r.headers.get('Location')
+        if r.status_code in (301, 302, 303, 307, 308) and loc:
+            r.close()
+            cur = urljoin(cur, loc)
+            if r.status_code == 303:
+                method = 'GET'
+            continue
+        return r
+    raise UnsafeURLError('слишком много перенаправлений')
+
+def playwright_guard(context, resolve=True):
+    """Блокирует любые запросы браузера (включая подресурсы и редиректы)
+    к непубличным адресам: вредоносная страница не сможет достучаться
+    до localhost или вашей локальной сети через Chromium."""
+    def _handler(route):
+        try:
+            u = route.request.url
+            if u.startswith(('data:', 'blob:', 'about:')) or is_public_http_url(u, resolve=resolve):
+                route.continue_()
+            else:
+                route.abort()
+        except Exception:
+            try:
+                route.abort()
+            except Exception:
+                pass
+    context.route('**/*', _handler)
+
+    # route() не перехватывает WebSocket-ы — фильтруем их отдельно
+    # (нужен Playwright >= 1.48; на старых остаётся защита через прокси).
+    def _ws_handler(ws):
+        try:
+            u = ws.url.replace('wss://', 'https://', 1).replace('ws://', 'http://', 1)
+            if is_public_http_url(u, resolve=resolve):
+                ws.connect_to_server()
+            else:
+                ws.close()
+        except Exception:
+            try:
+                ws.close()
+            except Exception:
+                pass
+    try:
+        context.route_web_socket('**/*', _ws_handler)
+    except AttributeError:
+        logger.warning("Playwright старой версии: WebSocket не фильтруются (обновите Playwright)")
+    except Exception as e:
+        logger.warning("Не удалось включить фильтр WebSocket: %s", e)
+
+# ================================================================
+#  ЗАЩИТА ЗАГРУЗЧИКОВ (yt-dlp): SSRF, плейлисты, лайвы, диск, cookies
+# ================================================================
+# Раньше публичность адреса проверялась только у ИСХОДНОЙ ссылки, а yt-dlp
+# дальше ходил куда хотел (редиректы, встроенные плееры, ссылки на форматы,
+# manifest-ы HLS/DASH, которые ffmpeg открывает сам). Теперь:
+#   * extract_info() проверяет адрес, с которого начинается извлечение;
+#   * urlopen() проверяет КАЖДЫЙ запрос yt-dlp и конечный адрес после редиректов;
+#   * process_info() проверяет адреса выбранных форматов/манифестов ДО скачивания
+#     (иначе ffmpeg-загрузчик мог бы сходить на внутренний адрес в обход urlopen);
+#   * отсекаются прямые эфиры, слишком длинные видео, закрытые видео
+#     (private/members-only/premium — их видит ваш аккаунт с cookies, а не гость);
+#   * перед скачиванием проверяется свободное место на диске.
+# Остаточный риск (DNS-rebinding между проверкой и реальным соединением) закрывается
+# только изоляцией сети: контейнер/отдельный пользователь + фаервол на исходящие
+# соединения во внутренние диапазоны.
+_COOKIE_HOSTS = ('youtube.com', 'youtu.be', 'youtube-nocookie.com')
+_SEARCH_PREFIX_RE = re.compile(r'^[a-z]+search(?:all|date)?\d*:', re.I)
+
+
+def host_matches(url, *domains):
+    """True, если hostname ссылки равен одному из доменов или является его
+    поддоменом. Проверка подстрокой ('tiktok.com' in url) обманывается ссылкой
+    вида https://evil.example/?x=tiktok.com — hostname так не обмануть."""
+    try:
+        host = (urlparse(url).hostname or '').lower().rstrip('.')
+    except Exception:
+        return False
+    return any(host == d or host.endswith('.' + d) for d in domains)
+
+
+def ns_id(namespace, vid):
+    """Идентификатор видео с пространством имён источника: ключ кэша не должен
+    совпадать у разных сайтов (иначе чужой сайт подсунет файл под id ролика)."""
+    return f"{namespace}-{vid}"
+
+
+def _uncacheable(video_id):
+    """Видео с префиксом nc- (generic-сайты, sniff) в кэш file_id не попадают."""
+    return str(video_id).startswith('nc-')
+
+
+def ensure_public_url(url):
+    if not is_public_http_url(url, resolve=not PROXY):
+        raise UnsafeURLError('адрес не публичный или недопустимый')
+
+
+def ensure_free_space(need_bytes):
+    """Не начинаем скачивание, если на диске не хватит места."""
+    try:
+        free = shutil.disk_usage(DOWNLOAD_DIR).free
+    except OSError:
+        return
+    if free < int(need_bytes) + MIN_FREE_DISK_BYTES:
+        raise MediaRejectedError('На сервере недостаточно свободного места, попробуйте позже.')
+
+
+def _estimate_size(info):
+    total = 0
+    for f in (info.get('requested_formats') or [info]):
+        if isinstance(f, dict):
+            total += f.get('filesize') or f.get('filesize_approx') or 0
+    # неизвестный размер — берём половину потолка; x2 — запас на склейку/конвертацию
+    return min((total or MAX_DOWNLOAD_BYTES // 2) * 2, MAX_DOWNLOAD_BYTES * 3)
+
+
+def check_media_allowed(info):
+    """Отсекает то, что бот скачивать не должен. Бросает MediaRejectedError."""
+    if not isinstance(info, dict):
+        return
+    if info.get('is_live') or info.get('live_status') in ('is_live', 'is_upcoming', 'post_live'):
+        raise MediaRejectedError('Прямые трансляции не поддерживаются.')
+    dur = info.get('duration')
+    if (isinstance(dur, (int, float)) and MAX_VIDEO_DURATION_SEC
+            and dur > MAX_VIDEO_DURATION_SEC):
+        raise MediaRejectedError(
+            f'Видео слишком длинное (максимум {MAX_VIDEO_DURATION_SEC // 3600} ч).')
+    if info.get('availability') in PRIVATE_AVAILABILITY:
+        raise MediaRejectedError(
+            'Это закрытое видео (приватное / для подписчиков / по подписке) — '
+            'такие ссылки бот не обрабатывает.')
+
+
+def _info_urls(info):
+    urls = []
+
+    def add(d):
+        if not isinstance(d, dict):
+            return
+        for k in ('url', 'manifest_url', 'fragment_base_url'):
+            v = d.get(k)
+            if isinstance(v, str) and v:
+                urls.append(v)
+        for fr in (d.get('fragments') or [])[:20]:
+            if isinstance(fr, dict) and isinstance(fr.get('url'), str):
+                urls.append(fr['url'])
+
+    add(info)
+    for f in (info.get('requested_formats') or []):
+        add(f)
+    return urls
+
+
+def _size_guard_hook(d):
+    """Потолок на размер одного потока и для потоков с неизвестной длиной:
+    max_filesize в yt-dlp для них не срабатывает."""
+    if d.get('status') == 'downloading':
+        if (d.get('downloaded_bytes') or 0) > MAX_DOWNLOAD_BYTES + 50_000_000:
+            raise MediaRejectedError('Файл слишком большой (лимит 2 ГБ на поток).')
+
+
+class SafeYoutubeDL(yt_dlp.YoutubeDL):
+    """YoutubeDL с проверками безопасности (см. комментарий выше)."""
+
+    def extract_info(self, url, *args, **kwargs):
+        if isinstance(url, str) and not _SEARCH_PREFIX_RE.match(url):
+            ensure_public_url(url)
+        return super().extract_info(url, *args, **kwargs)
+
+    def urlopen(self, req):
+        if isinstance(req, str):
+            req_url = req
+        else:
+            req_url = getattr(req, 'url', None) or getattr(req, 'full_url', None)
+        if isinstance(req_url, str) and req_url and not req_url.startswith('data:'):
+            ensure_public_url(req_url)
+        resp = super().urlopen(req)
+        try:
+            final = getattr(resp, 'url', None)
+            if not final and hasattr(resp, 'geturl'):
+                final = resp.geturl()
+            if isinstance(final, str) and final != req_url and not final.startswith('data:'):
+                ensure_public_url(final)      # редирект на внутренний адрес
+        except UnsafeURLError:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            raise
+        return resp
+
+    def process_info(self, info_dict):
+        if isinstance(info_dict, dict):
+            check_media_allowed(info_dict)
+            for u in _info_urls(info_dict):
+                if not u.startswith('data:'):
+                    ensure_public_url(u)
+            if not self.params.get('skip_download'):
+                ensure_free_space(_estimate_size(info_dict))
+        return super().process_info(info_dict)
+
+
+def make_ydl(opts, url=None, single=True):
+    """Единственная точка создания YoutubeDL в боте.
+    * cookies.txt подключаются ТОЛЬКО для ссылок YouTube (для остальных сайтов
+      cookiefile принудительно убирается);
+    * single=True: noplaylist + playlistend=1 — ссылка вида watch?v=..&list=..
+      скачает одно видео, а не весь плейлист."""
+    opts = dict(opts)
+    opts.pop('cookiefile', None)
+    if url and host_matches(url, *_COOKIE_HOSTS):
+        opts.update(cookies_opts())
+    if single:
+        opts.setdefault('noplaylist', True)
+        opts.setdefault('playlistend', 1)
+    opts['enable_file_urls'] = False
+    hooks = list(opts.get('progress_hooks') or [])
+    hooks.append(_size_guard_hook)
+    opts['progress_hooks'] = hooks
+    return SafeYoutubeDL(opts)
+
+
+def _looks_like_text(head):
+    """Настоящее медиа в первых килобайтах содержит нулевые/высокие байты.
+    Чистый ASCII-текст — это плейлист/SDP/скрипт, а не видео."""
+    return bool(head) and all(32 <= b < 127 or b in (9, 10, 13) for b in head)
+
+
+# ================================================================
+#  CHROMIUM: ФИЛЬТРУЮЩИЙ ПРОКСИ ДЛЯ ИСХОДЯЩИХ СОЕДИНЕНИЙ
+# ================================================================
+# playwright_guard() проверяет имя хоста сам, а Chromium потом резолвит его
+# повторно — между проверкой и соединением можно подменить DNS-ответ
+# (DNS-rebinding), и JS страницы получит доступ к localhost/локальной сети
+# и сможет прочитать ответ. Поэтому браузер ходит через маленький локальный
+# прокси: он САМ резолвит имя, отбраковывает непубличные адреса и подключается
+# строго к проверенному IP (имя второй раз не резолвится). Через него идут
+# и WebSocket-ы (CONNECT), которые route() не перехватывает.
+# Если задан внешний PROXY (VPN/Tor), локальный прокси не нужен — трафик и так
+# выходит из другой сети, а страницу по-прежнему охраняет playwright_guard().
+class _EgressProxy:
+    MAX_HEAD = 32 * 1024
+    MAX_CONN = 64
+    MAX_SESSION_SEC = 300
+    DROP_HEADERS = ('proxy-connection', 'connection', 'proxy-authorization',
+                    'keep-alive', 'upgrade', 'te', 'trailer')
+
+    def __init__(self):
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(('127.0.0.1', 0))
+        self.srv.listen(self.MAX_CONN)
+        self.port = self.srv.getsockname()[1]
+        self._sem = threading.BoundedSemaphore(self.MAX_CONN)
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            if not self._sem.acquire(blocking=False):
+                c.close()
+                continue
+            threading.Thread(target=self._client, args=(c,), daemon=True).start()
+
+    def _client(self, c):
+        try:
+            self._handle(c)
+        except Exception as e:
+            logger.debug("egress-proxy: %s", e)
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+            self._sem.release()
+
+    @staticmethod
+    def _reply(c, code, text):
+        try:
+            c.sendall(f"HTTP/1.1 {code} {text}\r\nContent-Length: 0\r\n"
+                      f"Connection: close\r\n\r\n".encode('latin-1'))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _open(host, port):
+        """Соединение с публичным адресом. Имя резолвится один раз, подключаемся
+        к проверенному IP. Любой непубличный адрес среди ответов — отказ."""
+        h = host.strip('[]').lower()
+        if h == 'localhost' or h.endswith(('.localhost', '.local', '.internal')):
+            raise UnsafeURLError('непубличный адрес')
+        if not (0 < port < 65536):
+            raise UnsafeURLError('некорректный порт')
+        try:
+            ips = [ipaddress.ip_address(h.split('%')[0])]
+        except ValueError:
+            infos = socket.getaddrinfo(h, port, type=socket.SOCK_STREAM)
+            ips = [ipaddress.ip_address(i[4][0].split('%')[0]) for i in infos]
+        if not ips or not all(_ip_is_public(ip) for ip in ips):
+            raise UnsafeURLError('непубличный адрес')
+        last = None
+        for ip in ips:
+            try:
+                s = socket.create_connection((str(ip), port), timeout=15)
+                s.settimeout(None)
+                return s
+            except OSError as e:
+                last = e
+        raise last or OSError('не удалось подключиться')
+
+    def _relay(self, a, b, idle=90):
+        a.settimeout(None)
+        b.settimeout(None)
+        socks = [a, b]
+        started = time.time()
+        while time.time() - started < self.MAX_SESSION_SEC:
+            r, _, x = select.select(socks, [], socks, idle)
+            if x or not r:
+                return
+            for s in r:
+                try:
+                    data = s.recv(65536)
+                    if not data:
+                        return
+                    (b if s is a else a).sendall(data)
+                except OSError:
+                    return
+
+    def _handle(self, c):
+        c.settimeout(30)
+        buf = b''
+        while b'\r\n\r\n' not in buf:
+            chunk = c.recv(8192)
+            if not chunk:
+                return
+            buf += chunk
+            if len(buf) > self.MAX_HEAD:
+                self._reply(c, 431, 'Request Header Fields Too Large')
+                return
+        head, _, rest = buf.partition(b'\r\n\r\n')
+        lines = head.decode('latin-1').split('\r\n')
+        try:
+            method, target, _ver = lines[0].split(' ', 2)
+        except ValueError:
+            self._reply(c, 400, 'Bad Request')
+            return
+
+        if method.upper() == 'CONNECT':
+            host, _, port_s = target.rpartition(':')
+            try:
+                up = self._open(host, int(port_s))
+            except Exception as e:
+                logger.warning("egress-proxy: CONNECT %s отклонён (%s)", target, e)
+                self._reply(c, 403, 'Forbidden')
+                return
+            try:
+                c.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+                if rest:
+                    up.sendall(rest)
+                self._relay(c, up)
+            finally:
+                up.close()
+            return
+
+        u = urlparse(target)
+        if u.scheme != 'http' or not u.hostname:
+            self._reply(c, 400, 'Bad Request')
+            return
+        try:
+            up = self._open(u.hostname, u.port or 80)
+        except Exception as e:
+            logger.warning("egress-proxy: %s отклонён (%s)", u.hostname, e)
+            self._reply(c, 403, 'Forbidden')
+            return
+        try:
+            path = (u.path or '/') + (('?' + u.query) if u.query else '')
+            hdrs = [ln for ln in lines[1:]
+                    if ln and ln.split(':', 1)[0].strip().lower() not in self.DROP_HEADERS]
+            if not any(h.lower().startswith('host:') for h in hdrs):
+                hdrs.append(f"Host: {u.netloc}")
+            req = (f"{method} {path} HTTP/1.1\r\n" + '\r\n'.join(hdrs)
+                   + "\r\nConnection: close\r\n\r\n")
+            up.sendall(req.encode('latin-1') + rest)
+            self._relay(c, up)
+        finally:
+            up.close()
+
+
+_egress_proxy = None
+_egress_lock = threading.Lock()
+
+
+def get_egress_proxy():
+    global _egress_proxy
+    with _egress_lock:
+        if _egress_proxy is None:
+            _egress_proxy = _EgressProxy()
+        return _egress_proxy
+
+
+# Аргументы Chromium: меньше лишнего (расширения, фоновая сеть, диалоги прав),
+# WebRTC не должен светить локальные адреса, а loopback обязан идти через
+# прокси (по умолчанию Chromium проксирование localhost обходит).
+CHROMIUM_ARGS = [
+    '--disable-extensions',
+    '--disable-background-networking',
+    '--disable-sync',
+    '--no-first-run',
+    '--mute-audio',
+    '--deny-permission-prompts',
+    '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+    '--webrtc-ip-handling-policy=disable_non_proxied_udp',
+    '--proxy-bypass-list=<-loopback>',
+]
+CONTEXT_HARDENING_KW = {'service_workers': 'block', 'accept_downloads': False}
+MAX_SNIFF_CANDIDATES = 30
+
+
+def chromium_launch_kwargs():
+    kw = {'headless': True, 'args': list(CHROMIUM_ARGS)}
+    if PROXY:
+        kw['proxy'] = {'server': playwright_proxy_server(PROXY)}
+    elif BLOCK_PRIVATE_URLS:
+        try:
+            kw['proxy'] = {'server': f'http://127.0.0.1:{get_egress_proxy().port}'}
+        except Exception as e:
+            logger.warning("Фильтрующий прокси для Chromium не запустился (%s) — "
+                           "остаётся только playwright_guard", e)
+    return kw
+
+
+_IMG_MAGIC = (b'\xff\xd8\xff', b'\x89PNG\r\n\x1a\n', b'GIF87a', b'GIF89a')
+
+def _is_real_image(path):
+    """True, только если файл по сигнатуре — настоящая картинка (jpeg/png/gif/webp)."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(16)
+    except OSError:
+        return False
+    return head.startswith(_IMG_MAGIC) or (head[:4] == b'RIFF' and head[8:12] == b'WEBP')
+
+def _reject_text_playlist(path):
+    """ffmpeg умеет читать плейлисты/манифесты (HLS, concat, DASH), которые
+    ссылаются на другие файлы. Скачанный из интернета «видеофайл» с таким
+    содержимым — известный приём для чтения локальных файлов через ffmpeg.
+    Настоящее медиа таким не бывает — отклоняем."""
+    try:
+        if not os.path.isfile(path):
+            return
+        with open(path, 'rb') as f:
+            head = f.read(4096).lower()
+    except OSError:
+        return
+    if (b'#extm3u' in head or b'#ext-x-' in head or b'#extinf' in head
+            or b'<mpd' in head or b'<smil' in head or b'[playlist]' in head
+            or head.lstrip().startswith((b'ffconcat', b'v=0', b'<?xml', b'<!doctype',
+                                         b'<html', b'#!'))
+            or _looks_like_text(head)):
+        raise Exception('файл похож на плейлист/манифест/текст, а не на медиа — отклонён')
+
 # ---------- ПОИСК ССЫЛКИ ----------
 URL_REGEX = re.compile(r'https?://[^\s]+')
+
+# Сайты, на ссылки которых бот заведомо не должен реагировать — это не
+# видеохостинги, и попытка их "скачать" через yt-dlp всегда просто упадёт
+# с ошибкой. Список неполный и его можно дополнять по мере того, как
+# всплывают новые примеры.
+IGNORED_URL_DOMAINS = {
+    'github.com', 'gitlab.com', 'gitee.com',
+    't.me', 'telegram.me', 'telegram.org', 'telegram.dog',
+    'discord.com', 'discord.gg', 'discordapp.com',
+    'docs.google.com', 'drive.google.com', 'forms.gle',
+    'wikipedia.org', 'stackoverflow.com', 'stackexchange.com',
+    'npmjs.com', 'pypi.org', 'readthedocs.io',
+    'whatsapp.com', 'wa.me',
+    'store.steampowered.com',
+}
+
+def _is_ignored_domain(url):
+    try:
+        host = url.split('://', 1)[-1].split('/', 1)[0].lower()
+        host = host.split('@')[-1].split(':')[0]  # без user:pass@ и :port
+        if host.startswith('www.'):
+            host = host[4:]
+        return host in IGNORED_URL_DOMAINS or any(
+            host.endswith('.' + d) for d in IGNORED_URL_DOMAINS)
+    except Exception:
+        return False
 
 def find_url(text):
     if not text:
@@ -504,7 +1286,18 @@ def find_url(text):
     m = URL_REGEX.search(text)
     if not m:
         return None
-    return m.group(0).rstrip('.,;:!?»')
+    url = m.group(0).rstrip('.,;:!?»')
+    if _is_ignored_domain(url):
+        return None
+    # ВАЖНО: эта функция работает в фильтре обработчиков, то есть в потоке приёма
+    # апдейтов. Блокирующий DNS (getaddrinfo) здесь недопустим — медленный
+    # DNS-сервер атакующего подвесил бы приём сообщений для всех. Поэтому тут
+    # только быстрая проверка без резолвинга, а полная (с DNS) — в
+    # process_url_message, уже в рабочем потоке.
+    if not is_public_http_url(url, resolve=False):
+        logger.warning("Ссылка отклонена (не публичный http/https адрес)")
+        return None
+    return url
 
 # ---------- УТИЛИТЫ ----------
 esc = html.escape
@@ -548,7 +1341,7 @@ def arrow_link(href):
     return f'<a href="{html.escape(href, quote=True)}">↗</a>'
 
 def sanitize_filename(name, max_len=60):
-    name = re.sub(r'[\\/:*?"<>|\r\n]', ' ', name or '')
+    name = re.sub(r'[\\/:*?"<>|%\r\n]', ' ', name or '')
     name = re.sub(r'\s+', ' ', name).strip(' .')
     name = name[:max_len]
     # Защита от задвоенного расширения (Title.m4r.mp3): если конец
@@ -568,8 +1361,17 @@ ALL_EXTS = ('.mp4', '.mp3', '.mkv', '.webm', '.m4a', '.opus', '.ogg',
             '.mpg', '.mpeg', '.ogv', '.mxf', '.m2ts', '.vob', '.wtv', '.divx',
             '.amv', '.roq')
 
+# Расширения, которые на самом деле — только звук. Нужны, чтобы не отправлять
+# аудиофайл через sendVideo (иначе получается «mp3 под видом mp4»).
+AUDIO_EXTS = {'mp3', 'm4a', 'opus', 'ogg', 'mp2', 'wav', 'm4r', 'flac', 'amr'}
+
+def _safe_id(video_id):
+    """video_id приходит от внешних сайтов и попадает в имена файлов —
+    оставляем только безопасные символы (защита от ../ и т.п.)."""
+    return re.sub(r'[^\w.\-]', '_', str(video_id))[:80].strip('.') or 'id'
+
 def base_path_for(title, video_id):
-    return os.path.join(DOWNLOAD_DIR, f"{sanitize_filename(title)} [{video_id}]")
+    return os.path.join(DOWNLOAD_DIR, f"{sanitize_filename(title)} [{_safe_id(video_id)}]")
 
 def find_downloaded_file(base_path):
     for ext in ALL_EXTS:
@@ -715,14 +1517,14 @@ def exact_format_size(fmt, timeout=6):
     headers = dict(fmt.get('http_headers') or {})
     headers.setdefault('User-Agent', UA)
     try:
-        r = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
+        r = safe_request('HEAD', url, headers=headers, timeout=timeout)
         cl = r.headers.get('Content-Length')
         if cl and cl.isdigit():
             return int(cl)
     except Exception:
         pass
     try:
-        r = requests.get(url, headers={**headers, 'Range': 'bytes=0-0'},
+        r = safe_request('GET', url, headers={**headers, 'Range': 'bytes=0-0'},
                          timeout=timeout, stream=True)
         cr = r.headers.get('Content-Range')  # формат: bytes 0-0/1234567
         if cr and '/' in cr:
@@ -884,12 +1686,21 @@ def download_thumbnail(url, video_id):
     if not url:
         return None
     try:
-        r = requests.get(url, timeout=30, headers={'User-Agent': UA})
-        if r.ok and r.content:
-            path = os.path.join(DOWNLOAD_DIR, f"{video_id}_thumb.jpg")
-            with open(path, 'wb') as f:
-                f.write(r.content)
-            return path
+        with safe_request('GET', url, timeout=30, headers={'User-Agent': UA}, stream=True) as r:
+            if r.ok:
+                data = b''
+                for chunk in r.iter_content(256 * 1024):
+                    data += chunk
+                    if len(data) > MAX_THUMB_BYTES:
+                        return None
+                if data:
+                    path = os.path.join(DOWNLOAD_DIR, f"{_safe_id(video_id)}_thumb.jpg")
+                    with open(path, 'wb') as f:
+                        f.write(data)
+                    if not _is_real_image(path):
+                        os.remove(path)   # не картинка — в ffmpeg не отдаём
+                        return None
+                    return path
     except Exception as e:
         logger.warning("Не удалось скачать превью: %s", e)
     return None
@@ -911,7 +1722,9 @@ def make_telegram_video_thumb(src_thumb_path, video_id, target_w=None, target_h=
     видео превью и так 16:9 — кроп ничего не меняет."""
     if not src_thumb_path:
         return None
-    out_path = os.path.join(DOWNLOAD_DIR, f"{video_id}_tgthumb.jpg")
+    if not src_thumb_path or not _is_real_image(src_thumb_path):
+        return None
+    out_path = os.path.join(DOWNLOAD_DIR, f"{_safe_id(video_id)}_tgthumb.jpg")
     if target_w and target_h:
         ar = target_w / target_h
         # Центральный кроп под аспект видео (crop сам центрирует, если
@@ -923,7 +1736,7 @@ def make_telegram_video_thumb(src_thumb_path, video_id, target_w=None, target_h=
         vf = "scale='min(320,iw)':'min(320,ih)':force_original_aspect_ratio=decrease"
     try:
         subprocess.run(
-            [FFMPEG_BIN, '-y', '-i', src_thumb_path,
+            [FFMPEG_BIN, '-y'] + FFMPEG_IN_GUARD + ['-i', src_thumb_path,
              '-vf', vf,
              '-q:v', '5', out_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
@@ -938,24 +1751,45 @@ def make_telegram_video_thumb(src_thumb_path, video_id, target_w=None, target_h=
         logger.warning("Не удалось подготовить превью для видео: %s", e)
     return None
 
+def _stream_to_file(r, dest_path):
+    total = 0
+    try:
+        cl = int(r.headers.get('Content-Length') or 0)
+    except ValueError:
+        cl = 0
+    if cl > MAX_DOWNLOAD_BYTES:
+        raise Exception('файл слишком большой (лимит 2 ГБ)')
+    ensure_free_space(cl or MAX_DOWNLOAD_BYTES // 4)
+    with open(dest_path, 'wb') as f:
+        for chunk in r.iter_content(1024 * 1024):
+            if chunk:
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise Exception('файл слишком большой (лимит 2 ГБ)')
+                f.write(chunk)
+
 def download_direct(url, dest_path):
-    with requests.get(url, stream=True, timeout=120,
-                      headers={'User-Agent': UA}) as r:
-        r.raise_for_status()
-        with open(dest_path, 'wb') as f:
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
-                    f.write(chunk)
+    try:
+        with safe_request('GET', url, stream=True, timeout=120,
+                          headers={'User-Agent': UA}) as r:
+            r.raise_for_status()
+            _stream_to_file(r, dest_path)
+    except Exception:
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        raise
     return dest_path
 
 def download_direct_headers(url, dest_path, headers, proxies=None):
-    with requests.get(url, stream=True, timeout=180, headers=headers,
-                      proxies=proxies) as r:
-        r.raise_for_status()
-        with open(dest_path, 'wb') as f:
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
-                    f.write(chunk)
+    try:
+        with safe_request('GET', url, stream=True, timeout=180, headers=headers,
+                          proxies=proxies) as r:
+            r.raise_for_status()
+            _stream_to_file(r, dest_path)
+    except Exception:
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        raise
     return dest_path
 
 def download_tiktok_url(url, dest_path, tt_data):
@@ -968,6 +1802,194 @@ def download_tiktok_url(url, dest_path, tt_data):
         proxies = {'http': PROXY, 'https': PROXY}
     return download_direct_headers(url, dest_path, headers, proxies=proxies)
 
+def _sniff_image_ext(path):
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(16)
+    except OSError:
+        return '.jpg'
+    if head[:8] == b'\x89PNG\r\n\x1a\n':
+        return '.png'
+    if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+        return '.webp'
+    return '.jpg'
+
+def _tg_photo_ready(path, work):
+    """Telegram надёжно принимает фото как JPEG/PNG до 10 МБ. WebP и огромные
+    файлы переводим в JPEG через ffmpeg; если ffmpeg не справился — отдаём как есть."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.jpg', '.jpeg', '.png') and os.path.getsize(path) < 9_000_000:
+        return path
+    out = os.path.join(work, os.path.splitext(os.path.basename(path))[0] + '_tg.jpg')
+    try:
+        proc = subprocess.run(
+            [FFMPEG_BIN, '-y'] + FFMPEG_IN_GUARD + ['-i', path, '-frames:v', '1',
+             '-vf', "scale='min(2560,iw)':-2", '-q:v', '2', out],
+            capture_output=True, text=True, errors='replace', timeout=120)
+        if proc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            return out
+    except Exception as e:
+        logger.warning("Не удалось привести фото к JPEG: %s", e)
+    return path
+
+def send_tiktok_photos(chat_id, tt_data, caption):
+    """Скачивает фото TikTok-поста и отправляет АЛЬБОМОМ (по 10 в группе —
+    лимит Telegram). Подпись — на первом фото. Возвращает список сообщений."""
+    images = tt_data.get('images') or []
+    if not images:
+        raise Exception('TikTok: у поста нет фотографий')
+    work = os.path.abspath(os.path.join(DOWNLOAD_DIR, f"photos_{uuid.uuid4().hex}"))
+    os.makedirs(work, exist_ok=True)
+    try:
+        files = []
+        for i, u in enumerate(images):
+            p = os.path.join(work, f"img_{i:03d}.tmp")
+            try:
+                download_tiktok_url(u, p, tt_data)
+                if os.path.getsize(p) <= 0 or not _is_real_image(p):
+                    logger.warning("TikTok фото %d: файл не распознан как jpeg/png/webp — пропущено", i)
+                    continue
+                final = os.path.splitext(p)[0] + _sniff_image_ext(p)
+                os.replace(p, final)
+                files.append(_tg_photo_ready(final, work))
+            except Exception as e:
+                logger.warning("TikTok фото %d не скачалось: %s", i, e)
+        if not files:
+            raise Exception('TikTok: не удалось скачать ни одной фотографии')
+
+        sent = []
+        for start in range(0, len(files), 10):
+            chunk = files[start:start + 10]
+            handles = [open(f, 'rb') for f in chunk]
+            try:
+                media = []
+                for k, h in enumerate(handles):
+                    if start == 0 and k == 0:
+                        media.append(InputMediaPhoto(h, caption=caption, parse_mode='HTML'))
+                    else:
+                        media.append(InputMediaPhoto(h))
+                if len(media) == 1:
+                    sent.append(bot.send_photo(chat_id, handles[0], caption=caption if start == 0 else None,
+                                               parse_mode='HTML'))
+                else:
+                    sent += bot.send_media_group(chat_id, media)
+            finally:
+                for h in handles:
+                    try:
+                        h.close()
+                    except Exception:
+                        pass
+        return sent
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+def build_tiktok_slideshow(tt_data, out_path):
+    """Собирает mp4 из фотографий TikTok-поста + его музыки (ffmpeg).
+    Каждое фото показывается равное время, общая длина = длина музыки."""
+    images = tt_data.get('images') or []
+    if not images:
+        raise Exception('TikTok: у поста нет фотографий')
+    music_url = (tt_data.get('downloads') or {}).get('music')
+
+    # ВАЖНО: абсолютный путь. concat-демуксер ffmpeg читает относительные пути
+    # из list.txt НЕ от текущей папки, а от папки самого list.txt — с
+    # относительным DOWNLOAD_DIR получалось 'downloads/slides_x/downloads/slides_x/img.jpg'.
+    work = os.path.abspath(os.path.join(DOWNLOAD_DIR, f"slides_{uuid.uuid4().hex}"))
+    os.makedirs(work, exist_ok=True)
+    try:
+        img_files = []
+        for i, u in enumerate(images):
+            p = os.path.join(work, f"img_{i:03d}.tmp")
+            try:
+                download_tiktok_url(u, p, tt_data)
+                if os.path.getsize(p) <= 0 or not _is_real_image(p):
+                    logger.warning("TikTok слайд %d: файл не распознан как jpeg/png/webp — пропущен", i)
+                    continue
+                final = os.path.splitext(p)[0] + _sniff_image_ext(p)
+                os.replace(p, final)
+                img_files.append(final)
+            except Exception as e:
+                logger.warning("TikTok слайд %d не скачался: %s", i, e)
+        if not img_files:
+            raise Exception('TikTok: не удалось скачать ни одной фотографии')
+
+        audio = None
+        audio_dur = None
+        if music_url:
+            audio = os.path.join(work, 'music.mp3')
+            try:
+                download_tiktok_url(music_url, audio, tt_data)
+                _reject_text_playlist(audio)
+                audio_dur = probe_duration_ffmpeg(audio)
+            except Exception as e:
+                logger.warning("TikTok музыка для слайд-шоу не скачалась: %s", e)
+                audio = None
+
+        total = audio_dur or tt_data.get('duration') or len(img_files) * 3
+        per = max(float(total) / len(img_files), 1.0)
+
+        # ШАГ 1. Каждое фото -> готовый кадр 720x1280 (по центру поверх своей же
+        # размытой копии, как в самом TikTok). Все кадры ОДИНАКОВОГО размера.
+        # Раньше фото шли в ffmpeg как есть через concat-демуксер, и при РАЗНЫХ
+        # размерах фото (в TikTok-постах это норма) ffmpeg терял все кадры, кроме
+        # последнего: видеодорожка выходила короче звука (20 с вместо 60) и с одним
+        # последним фото — отсюда «показывает только последнее фото» и перемотка
+        # на 00:00, которая «телепортирует» на 00:20.
+        bg_vf = ("split=2[bg][fg];"
+                 "[bg]scale=720:1280:force_original_aspect_ratio=increase,"
+                 "crop=720:1280,boxblur=25:5[b];"
+                 "[fg]scale=720:1280:force_original_aspect_ratio=decrease[f];"
+                 "[b][f]overlay=(W-w)/2:(H-h)/2")
+        slides = []
+        for k, p in enumerate(img_files):
+            sp = os.path.join(work, f"slide_{k:03d}.jpg")
+            proc = subprocess.run(
+                [FFMPEG_BIN, '-y'] + FFMPEG_IN_GUARD + ['-i', p, '-vf', bg_vf,
+                 '-frames:v', '1', '-q:v', '2', sp],
+                capture_output=True, text=True, errors='replace', timeout=120)
+            if proc.returncode == 0 and os.path.exists(sp) and os.path.getsize(sp) > 0:
+                slides.append(sp)
+            else:
+                logger.warning("TikTok слайд %d не обработан ffmpeg: %s", k,
+                               (proc.stderr or '')[-200:])
+        if not slides:
+            raise Exception('ffmpeg не смог обработать ни одной фотографии')
+        if len(slides) < len(images):
+            logger.warning("Слайд-шоу: в ролик попало %d из %d фото", len(slides), len(images))
+        per = max(float(total) / len(slides), 1.0)
+
+        # ШАГ 2. Каждый кадр -> свой «зацикленный» вход ровно на per секунд,
+        # склейка фильтром concat (а не demuxer'ом) — тайминг не зависит от
+        # версии ffmpeg. Ключевой кадр каждые 2 с — чтобы Telegram мог
+        # перематывать куда угодно (в том числе в самое начало).
+        cmd = [FFMPEG_BIN, '-y']
+        for sp in slides:
+            cmd += ['-loop', '1', '-framerate', '30', '-t', f"{per:.3f}"] \
+                   + FFMPEG_IN_GUARD + ['-i', sp]
+        if audio:
+            cmd += FFMPEG_IN_GUARD + ['-i', audio]
+        n = len(slides)
+        fc = ''.join(f"[{k}:v]setsar=1,fps=30,format=yuv420p[v{k}];" for k in range(n))
+        fc += ''.join(f"[v{k}]" for k in range(n)) + f"concat=n={n}:v=1:a=0[v]"
+        cmd += ['-filter_complex', fc, '-map', '[v]']
+        if audio:
+            cmd += ['-map', f"{n}:a", '-c:a', 'aac', '-b:a', '128k', '-shortest']
+        else:
+            cmd += ['-an']
+        cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                '-force_key_frames', 'expr:gte(t,n_forced*2)',
+                '-movflags', '+faststart', out_path]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              errors='replace', timeout=600)
+        if proc.returncode != 0 or not os.path.exists(out_path) \
+                or os.path.getsize(out_path) == 0:
+            logger.error("ffmpeg не смог собрать слайд-шоу: %s", (proc.stderr or '')[-400:])
+            raise Exception('ffmpeg не смог собрать слайд-шоу (подробности в логе бота)')
+        return out_path
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
 # ---------- КЛАВИАТУРЫ ----------
 def build_video_kb(data):
     kb = InlineKeyboardMarkup()
@@ -977,8 +1999,15 @@ def build_video_kb(data):
         sizes = d.get('sizes') or {}
         vs = format_file_size(sizes.get('video'))
         v_icon = '🚀' if is_cached(video_id, 'tt_video') else '🎥'
-        kb.row(InlineKeyboardButton(
-            f"{v_icon} Видео" + (f": {vs}" if vs else ""), callback_data='tt_video'))
+        if d.get('images'):
+            kb.row(InlineKeyboardButton(
+                f"🖼 Фото ({len(d['images'])} шт.)", callback_data='tt_photos'))
+            kb.row(InlineKeyboardButton(
+                f"{v_icon if v_icon == '🚀' else '🎞'} Слайд-шоу с музыкой",
+                callback_data='tt_video'))
+        else:
+            kb.row(InlineKeyboardButton(
+                f"{v_icon} Видео" + (f": {vs}" if vs else ""), callback_data='tt_video'))
         if d['downloads'].get('hd'):
             hs = format_file_size(sizes.get('hd'))
             hd_icon = '🚀' if is_cached(video_id, 'tt_hd') else '✨'
@@ -1183,7 +2212,7 @@ def build_final_caption(data, file_size, quality_text):
     date = format_date(info.get('upload_date')) or tt.get('date_str')
     if date:
         meta.append(f"📅 {date}")
-    dur = format_duration(info.get('duration') or tt.get('duration'))
+    dur = format_duration(info.get('duration') or (None if tt.get('images') else tt.get('duration')))
     if dur:
         meta.append(f"⏱ {dur}")
     res = (f"{info['width']}×{info['height']}"
@@ -1234,16 +2263,146 @@ def _proxies_dict():
     провайдерам, а не только Playwright."""
     return {'http': PROXY, 'https': PROXY} if PROXY else None
 
-def prov_tikwm(url):
-    api = 'https://www.tikwm.com/api/?url=' + quote(url, safe='')
-    r = requests.get(api, timeout=30, headers={'User-Agent': UA}, proxies=_proxies_dict())
-    r.raise_for_status()
-    j = r.json()
-    if j.get('code') != 0 or not j.get('data'):
-        raise Exception(f"code={j.get('code')} msg={j.get('msg')}")
-    d = j['data']
+# ---------- TikTok: общие помощники ----------
+class TikTokError(Exception):
+    """Ни один из источников не отдал пост TikTok (понятная пользователю причина)."""
+    pass
+
+def normalize_tiktok_url(url):
+    """Убирает трекинговые параметры (?is_from_webapp=1&sender_device=pc и т.п.):
+    они не нужны ни одному провайдеру, а часть API на них спотыкается."""
+    try:
+        u = urlparse(url)
+        host = (u.hostname or '').lower()
+        if host.endswith('tiktok.com') and u.path and u.path != '/':
+            return f"{u.scheme}://{u.netloc}{u.path}"
+    except Exception:
+        pass
+    return url
+
+def tiktok_url_variants(url):
+    """Для /photo/-ссылок сначала пробуем тот же пост по адресу /video/: по
+    логам именно так TikTok отдаёт его данные Playwright'у, а /photo/-страница
+    в headless-режиме остаётся пустой. Оригинальную ссылку оставляем запасной."""
+    out = []
+    try:
+        u = urlparse(url)
+        if '/photo/' in u.path:
+            out.append(url.replace('/photo/', '/video/', 1))
+    except Exception:
+        pass
+    out.append(url)
+    return out
+
+def tiktok_is_photo_url(url):
+    try:
+        return '/photo/' in urlparse(url).path
+    except Exception:
+        return False
+
+def _tt_http(method, url, timeout=30, **kw):
+    """requests (с PROXY, если задан). Если ответ 403 — одна попытка через
+    curl_cffi с TLS-отпечатком Chrome (pip install curl_cffi): Cloudflare
+    перед tikwm часто режет «голый» python-requests именно по отпечатку."""
+    proxies = _proxies_dict()
+    r = requests.request(method, url, timeout=timeout, proxies=proxies, **kw)
+    if r.status_code == 403:
+        try:
+            from curl_cffi import requests as cffi_requests
+        except ImportError:
+            return r
+        try:
+            return cffi_requests.request(method, url, timeout=timeout,
+                                         proxies=proxies, impersonate='chrome', **kw)
+        except Exception as e:
+            logger.info("curl_cffi тоже не помог (%s): %s", url.split('?')[0], e)
+    return r
+
+# ---------- TikTok: разбор данных страницы (HTML / Playwright) ----------
+_TT_STATE_RE = re.compile(
+    r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', re.S)
+
+def _tt_find_item(state):
+    """Достаёт itemStruct поста из состояния страницы. Ищем по всем веткам
+    __DEFAULT_SCOPE__, а не только по 'webapp.video-detail': у фото-постов
+    название ветки может отличаться."""
+    scope = (state or {}).get('__DEFAULT_SCOPE__') or {}
+    for val in scope.values():
+        if isinstance(val, dict):
+            st = (val.get('itemInfo') or {}).get('itemStruct')
+            if isinstance(st, dict) and st:
+                return st
+    return {}
+
+def _tt_item_to_info(item, url):
+    """itemStruct страницы TikTok -> наш формат. Понимает и видео, и
+    фото-посты (imagePost.images[])."""
+    item = item or {}
+    author = item.get('author')
+    if not isinstance(author, dict):
+        author = {}
+    music = item.get('music') if isinstance(item.get('music'), dict) else {}
+    stats = item.get('stats') or {}
+    video = item.get('video') or {}
+    post = item.get('imagePost') or {}
+
+    images = []
+    for im in (post.get('images') or []):
+        lst = ((im or {}).get('imageURL') or {}).get('urlList') or []
+        if lst:
+            images.append(lst[0])
+
+    cover = video.get('cover')
+    if not cover:
+        cl = ((post.get('cover') or {}).get('imageURL') or {}).get('urlList') or []
+        cover = cl[0] if cl else (images[0] if images else None)
+
+    unique_id = author.get('uniqueId')
+    music_url = music.get('playUrl')
+    return {
+        'title': item.get('desc'),
+        'author': author.get('nickname'),
+        'author_url': f"https://www.tiktok.com/@{unique_id}" if unique_id else None,
+        'video_id': str(item.get('id') or slug_from_url(url) or 'tiktok'),
+        'duration': (music.get('duration') if images else video.get('duration')),
+        'views': stats.get('playCount'),
+        'likes': stats.get('diggCount'),
+        'cover': cover,
+        'date_str': format_ts(item.get('createTime')),
+        'images': images,
+        'downloads': {'video': None, 'hd': None,
+                      'audio': music_url, 'music': music_url},
+        'sizes': {},
+        # CDN TikTok отдаёт файлы только с правильным Referer/UA
+        'fetch_headers': {'User-Agent': UA, 'Referer': 'https://www.tiktok.com/'},
+        'fetch_via_proxy': bool(PROXY),
+    }
+
+# ---------- TikTok: tikwm ----------
+# Бесплатный API tikwm: лимит 1 запрос/сек, «голые» GET-запросы часто
+# получают 403 от Cloudflare. Поэтому: общий троттлинг на весь бот,
+# POST как у их собственного сайта, браузерные заголовки, зеркало домена,
+# повторы только при rate-limit и (если установлен curl_cffi) обход по TLS-отпечатку.
+TIKWM_HOSTS = ('https://www.tikwm.com', 'https://tikwm.com')
+TIKWM_MIN_INTERVAL = 1.2
+_tikwm_lock = threading.Lock()
+_tikwm_last = [0.0]
+
+def _tikwm_throttle():
+    with _tikwm_lock:   # замок держим во время сна — потоки встают в очередь
+        wait = TIKWM_MIN_INTERVAL - (time.time() - _tikwm_last[0])
+        if wait > 0:
+            time.sleep(wait)
+        _tikwm_last[0] = time.time()
+
+def _tikwm_to_info(d, url):
     author = d.get('author') or {}
     unique_id = author.get('unique_id')
+    # Фото-пост («слайд-шоу» с музыкой): у него нет видеодорожки, а картинки
+    # лежат в d['images']. Видео из них собираем сами (build_tiktok_slideshow).
+    images = [abs_tikwm(u) for u in (d.get('images') or []) if u]
+    music = (abs_tikwm(d.get('music'))
+             or abs_tikwm((d.get('music_info') or {}).get('play')))
     return {
         'title': d.get('title'),
         'author': author.get('nickname'),
@@ -1254,46 +2413,72 @@ def prov_tikwm(url):
         'likes': d.get('digg_count'),
         'cover': abs_tikwm(d.get('cover')) or abs_tikwm(d.get('origin_cover')),
         'date_str': format_ts(d.get('create_time')),
+        'images': images,
         'downloads': {
-            'video': abs_tikwm(d.get('play')),
-            'hd':    abs_tikwm(d.get('hd')),
-            'audio': abs_tikwm(d.get('music')),
-            'music': abs_tikwm(d.get('music')),
+            # у фото-поста поле play — это не видео, поэтому его не берём
+            'video': None if images else abs_tikwm(d.get('play')),
+            'hd':    None if images else abs_tikwm(d.get('hd')),
+            'audio': music,
+            'music': music,
         },
         'sizes': {
             'video': d.get('size'),
             'hd':    d.get('hd_size'),
             'audio': d.get('music_size'),
         },
+        'fetch_headers': {'User-Agent': UA, 'Referer': 'https://www.tikwm.com/'},
+        'fetch_via_proxy': bool(PROXY),
     }
 
-def prov_tiklydown(url):
-    # api.tiklydown.me не резолвится (мёртвый домен) — оставляем только
-    # живой eu.org (подтверждено его собственной статус-страницей). Раньше
-    # цикл пробовал оба и запоминал ТОЛЬКО последнюю ошибку — то есть в
-    # логах всегда была бы ошибка мёртвого .me, а настоящая причина отказа
-    # живого eu.org терялась.
-    host = 'https://api.tiklydown.eu.org'
-    r = requests.get(host + '/api/download?url=' + quote(url, safe=''),
-                     timeout=30, headers={'User-Agent': UA}, proxies=_proxies_dict())
-    r.raise_for_status()
-    j = r.json()
-    video = (j.get('video') or {}).get('noWatermark')
-    if not video:
-        raise Exception(f'нет ссылки на видео (ответ: {str(j)[:200]})')
-    author = j.get('author') or {}
-    username = author.get('username')
-    return {
-        'title': j.get('title'),
-        'author': author.get('name'),
-        'author_url': f"https://www.tiktok.com/@{username}" if username else None,
-        'video_id': str(slug_from_url(url) or 'tiktok'),
-        'duration': None, 'views': None, 'likes': None,
-        'cover': None, 'date_str': None,
-        'downloads': {'video': video, 'hd': None,
-                      'audio': j.get('music'), 'music': j.get('music')},
-        'sizes': {},
+def prov_tikwm(url):
+    clean = normalize_tiktok_url(url)
+    headers = {
+        'User-Agent': UA,
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'Origin': 'https://www.tikwm.com',
+        'Referer': 'https://www.tikwm.com/',
+        'X-Requested-With': 'XMLHttpRequest',
     }
+    form = {'url': clean, 'count': 12, 'cursor': 0, 'web': 1, 'hd': 1}
+    last = None
+    for attempt in range(3):
+        retry = False
+        for host in TIKWM_HOSTS:
+            _tikwm_throttle()
+            try:
+                r = _tt_http('POST', host + '/api/', headers=headers, data=form)
+                if r.status_code == 429:
+                    retry = True
+                    last = Exception(f"HTTP 429 (rate-limit, {host})")
+                    continue
+                if r.status_code == 403:
+                    # Повторять бессмысленно: это блок по IP/отпечатку, а не лимит.
+                    try:
+                        import curl_cffi  # noqa: F401
+                        hint = "curl_cffi уже стоит — значит, блокируют IP: задайте PROXY"
+                    except ImportError:
+                        hint = "установите curl_cffi (pip install curl_cffi) или задайте PROXY"
+                    last = Exception(f"HTTP 403 ({host}): tikwm блокирует запрос — {hint}")
+                    continue
+                r.raise_for_status()
+                j = r.json()
+            except Exception as e:
+                last = e
+                continue
+            msg = str(j.get('msg') or '')
+            if j.get('code') == 0 and j.get('data'):
+                return _tikwm_to_info(j['data'], clean)
+            if 'limit' in msg.lower():
+                retry = True
+                last = Exception(f"rate-limit: {msg}")
+                continue
+            # пост удалён/приватный/не поддерживается — повторы ничего не изменят
+            raise Exception(f"code={j.get('code')} msg={msg}")
+        if not retry:
+            break
+        time.sleep(2 * (attempt + 1))
+    raise last or Exception('tikwm недоступен')
 
 COBALT_INSTANCES = (
     'https://cobalt-api.meow.lol',
@@ -1326,9 +2511,17 @@ def discover_cobalt_instances(service='vimeo', limit=6):
     if cached and now - cached[0] < COBALT_INSTANCE_CACHE_TTL:
         return cached[1]
     try:
-        headers = {'User-Agent': f'{BOT_BASE_NAME}-bot/1.0 (Telegram downloader bot)'}
-        r = requests.get(COBALT_DIRECTORY_API, headers=headers, timeout=15,
-                         proxies=_proxies_dict())
+        headers = {'User-Agent': UA}   # НЕ BOT_BASE_NAME: кириллица в заголовке -> UnicodeEncodeError (latin-1)
+        try:
+            r = requests.get(COBALT_DIRECTORY_API, headers=headers, timeout=15,
+                             proxies=_proxies_dict())
+        except requests.exceptions.SSLError:
+            if not INSECURE_TLS:
+                raise
+            # Каталог отдаёт лишь список адресов (каждый потом проверяется на
+            # «публичность»), но трафик без проверки сертификата — на ваш риск.
+            r = requests.get(COBALT_DIRECTORY_API, headers=headers, timeout=15,
+                             proxies=_proxies_dict(), verify=False)
         r.raise_for_status()
         items = r.json()
         good = []
@@ -1351,36 +2544,80 @@ def discover_cobalt_instances(service='vimeo', limit=6):
         logger.warning("Не удалось получить список Cobalt-инстансов для %s: %s", service, e)
         return []
 
-def prov_cobalt(url):
+def _cobalt_call(inst, payload):
     headers = {'Accept': 'application/json',
                'Content-Type': 'application/json',
                'User-Agent': UA}
+    try:
+        resp = requests.post(inst, json=payload, headers=headers, timeout=30,
+                             proxies=_proxies_dict())
+    except requests.exceptions.SSLError:
+        if not INSECURE_TLS:
+            raise
+        resp = requests.post(inst, json=payload, headers=headers, timeout=30,
+                             proxies=_proxies_dict(), verify=False)
+    try:
+        return resp.json()
+    except ValueError:
+        # Не JSON — заглушка/Cloudflare-страница/старый инстанс. Без сырого
+        # фрагмента причина не видна («Expecting value: line 1 column 1»).
+        snippet = resp.text[:120].replace('\n', ' ')
+        raise Exception(f"{inst}: не JSON (HTTP {resp.status_code}): {snippet!r}")
+
+def _cobalt_info(url, video=None, audio=None, images=None):
+    return {
+        'title': None, 'author': None, 'author_url': None,
+        'video_id': str(slug_from_url(url) or 'tiktok'),
+        'duration': None, 'views': None, 'likes': None,
+        'cover': (images[0] if images else None), 'date_str': None,
+        'images': list(images or []),
+        'downloads': {'video': None if images else video, 'hd': None,
+                      'audio': audio, 'music': audio},
+        'sizes': {},
+        'fetch_via_proxy': bool(PROXY),
+    }
+
+def prov_cobalt(url):
+    """Cobalt: только ЖИВЫЕ инстансы (каталог instances.cobalt.best, у которых
+    именно tiktok сейчас проходит тест); статический список — лишь
+    подстраховка в конце. Умеет фото-посты: отвечает status='picker'."""
+    clean = normalize_tiktok_url(url)
+    discovered = discover_cobalt_instances('tiktok')
+    instances = discovered + [i for i in COBALT_INSTANCES if i not in discovered]
     proxies = _proxies_dict()
-    video_url = audio_url = None
     last = None
-    for inst in COBALT_INSTANCES:
+    for inst in instances[:6]:
+        if not is_public_http_url(inst, resolve=not proxies):
+            continue
         try:
-            rv = requests.post(inst, json={'url': url},
-                               headers=headers, timeout=30, proxies=proxies).json()
-            if rv.get('status') in ('tunnel', 'redirect') and rv.get('url'):
-                video_url = rv['url']
-            ra = requests.post(inst, json={'url': url, 'downloadMode': 'audio'},
-                               headers=headers, timeout=30, proxies=proxies).json()
-            if ra.get('status') in ('tunnel', 'redirect') and ra.get('url'):
-                audio_url = ra['url']
-            if video_url:
-                return {
-                    'title': None, 'author': None, 'author_url': None,
-                    'video_id': str(slug_from_url(url) or 'tiktok'),
-                    'duration': None, 'views': None, 'likes': None,
-                    'cover': None, 'date_str': None,
-                    'downloads': {'video': video_url, 'hd': None,
-                                  'audio': audio_url, 'music': audio_url},
-                    'sizes': {},
-                }
+            r = _cobalt_call(inst, {'url': clean})
+            status = r.get('status')
+
+            if status in ('tunnel', 'redirect') and r.get('url'):
+                audio_url = None
+                try:
+                    ra = _cobalt_call(inst, {'url': clean, 'downloadMode': 'audio'})
+                    if ra.get('status') in ('tunnel', 'redirect') and ra.get('url'):
+                        audio_url = ra['url']
+                except Exception:
+                    pass   # без аудио видео всё равно скачается
+                return _cobalt_info(clean, video=r['url'], audio=audio_url)
+
+            if status == 'picker':
+                items = [p for p in (r.get('picker') or []) if isinstance(p, dict) and p.get('url')]
+                photos = [p['url'] for p in items if p.get('type', 'photo') == 'photo']
+                if photos:
+                    return _cobalt_info(clean, audio=r.get('audio'), images=photos)
+                vids = [p['url'] for p in items if p.get('type') in ('video', 'gif')]
+                if vids:
+                    return _cobalt_info(clean, video=vids[0], audio=r.get('audio'))
+
+            err = r.get('error')
+            err = err.get('code') if isinstance(err, dict) else err
+            last = Exception(f"{inst}: status={status} error={err}")
         except Exception as e:
             last = e
-    raise last or Exception('cobalt недоступен')
+    raise last or Exception('cobalt: нет доступных инстансов')
 
 def cobalt_direct_url(url, audio=False, service_hint=None):
     """Общая (не завязанная на форму данных TikTok) обёртка над Cobalt —
@@ -1414,7 +2651,11 @@ def cobalt_direct_url(url, audio=False, service_hint=None):
 
     last = None
     for inst in instances:
-        for verify in (True, False):
+        # адрес инстанса приходит из внешнего каталога — не доверяем слепо
+        if not is_public_http_url(inst, resolve=not proxies):
+            logger.warning("Cobalt-инстанс отклонён (не публичный адрес): %s", inst)
+            continue
+        for verify in ((True, False) if INSECURE_TLS else (True,)):
             try:
                 resp = requests.post(inst, json=payload, headers=headers, timeout=30,
                                      proxies=proxies, verify=verify)
@@ -1447,124 +2688,144 @@ def cobalt_direct_url(url, audio=False, service_hint=None):
     raise last or Exception('Cobalt недоступен')
 
 
-def prov_playwright_tiktok(url):
-    """Резервный провайдер через настоящий headless-браузер — на случай,
-    когда видео гео-заблокировано (та же причина, по которой человеку
-    самому нужен VPN, чтобы его посмотреть). API-загрузчики (tikwm и
-    остальные) сидят на своих фиксированных серверах — если сервер
-    оказался в заблокированном для этого видео регионе, они просто
-    вернут ошибку независимо от того, короткая ссылка или длинная
-    (сами загрузчики одинаково понимают оба формата — дело не в этом).
+def prov_tiktok_html(url):
+    """Без браузера: фото-посты TikTok отдают все данные (картинки, музыку)
+    прямо в HTML страницы. Быстро и не требует Playwright. Для видео не
+    годится (ссылка на видео привязана к cookies) — там нужен Playwright."""
+    headers = {
+        'User-Agent': UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.tiktok.com/',
+    }
+    last = None
+    for u in tiktok_url_variants(url):
+        try:
+            r = safe_request('GET', u, headers=headers, timeout=25,
+                             proxies=_proxies_dict())
+            r.raise_for_status()
+            m = _TT_STATE_RE.search(r.text)
+            if not m:
+                raise Exception('в HTML нет данных поста (капча или редирект на логин)')
+            item = _tt_find_item(json.loads(m.group(1)))
+            if not item:
+                raise Exception('пост не найден в данных страницы')
+            info = _tt_item_to_info(item, url)
+            if not info['images']:
+                raise Exception('это не фото-пост')
+            return info
+        except Exception as e:
+            last = e
+    raise last
 
-    Playwright же можно пустить через PROXY (обычный прокси/VPN-адрес,
-    который уже используется для yt-dlp) — тогда браузер физически
-    заходит с IP другого региона, точно как это делает пользователь
-    через свой VPN. Без настроенного PROXY этот провайдер, скорее всего,
-    упрётся в ту же самую блокировку, что и остальные."""
+def _tt_playwright_once(url):
+    """Резервный провайдер через настоящий headless-браузер — на случай,
+    когда API-загрузчики недоступны или видео гео-заблокировано.
+    Playwright можно пустить через PROXY — тогда браузер заходит с IP
+    нужного региона. Понимает и видео, и фото-посты (imagePost.images[])."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         raise Exception("Playwright не установлен")
 
+    is_photo = False   # по URL фото-пост не отличить от видео
     captured = {}
     page_json = {}
 
     with sync_playwright() as p:
-        launch_kwargs = {'headless': True}
-        if PROXY:
-            launch_kwargs['proxy'] = {'server': playwright_proxy_server(PROXY)}
-        browser = p.chromium.launch(**launch_kwargs)
+        browser = p.chromium.launch(**chromium_launch_kwargs())
         try:
             context = browser.new_context(user_agent=UA, locale='en-US',
-                                          viewport={'width': 390, 'height': 844})
+                                          viewport={'width': 390, 'height': 844},
+                                          **CONTEXT_HARDENING_KW)
+            playwright_guard(context, resolve=not PROXY)
 
             def on_response(resp):
                 try:
-                    if (not captured.get('video')
-                            and resp.request.resource_type == 'media'
-                            and resp.status == 200):
-                        captured['video'] = resp.url
+                    if captured.get('video') or resp.status != 200:
+                        return
+                    if resp.request.resource_type != 'media':
+                        return
+                    # У фото-поста играет фоновая музыка — это тоже 'media',
+                    # но не видео. Раньше она ошибочно бралась за видео.
+                    ct = (resp.headers.get('content-type') or '').lower()
+                    if ct.startswith('audio'):
+                        return
+                    captured['video'] = resp.url
                 except Exception:
                     pass
 
             page = context.new_page()
             page.on('response', on_response)
             # Через Tor/медленный прокси установление цепочки + TLS может
-            # занимать 10-20 сек само по себе — 30 сек мало, увеличиваем,
-            # когда прокси вообще используется.
+            # занимать 10-20 сек само по себе — увеличиваем таймаут.
             nav_timeout = 60000 if PROXY else 30000
             page.goto(url, wait_until='domcontentloaded', timeout=nav_timeout)
-            try:
-                page.wait_for_selector('video', timeout=15000)
-            except Exception:
-                pass
-            page.wait_for_timeout(3000)  # дать шанс медиа-запросу проскочить
+            if is_photo:
+                page.wait_for_timeout(2000)      # <video> у фото-поста нет — не ждём 15 сек
+            else:
+                try:
+                    page.wait_for_selector('video', timeout=15000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(3000)      # дать шанс медиа-запросу проскочить
 
-            # Метаданные (автор, описание, музыка) достаём из встроенного
-            # в страницу JSON — это надёжнее, чем парсить DOM.
+            # Метаданные и список фото достаём из встроенного в страницу JSON —
+            # это надёжнее, чем парсить DOM.
             try:
                 raw = page.evaluate(
                     "document.querySelector('#__UNIVERSAL_DATA_FOR_REHYDRATION__')?.textContent || null")
                 if raw:
-                    j = json.loads(raw)
-                    scope = j.get('__DEFAULT_SCOPE__', {})
-                    page_json = (scope.get('webapp.video-detail', {})
-                                .get('itemInfo', {}).get('itemStruct', {}))
+                    page_json = _tt_find_item(json.loads(raw))
             except Exception as e:
                 logger.warning("TikTok Playwright: JSON-состояние не прочитано: %s", e)
-
-            if not captured.get('video'):
-                video_info = page_json.get('video') or {}
-                captured['video'] = video_info.get('playAddr') or video_info.get('downloadAddr')
         finally:
             browser.close()
 
-    video_url = captured.get('video')
+    info = _tt_item_to_info(page_json, url)
+    if info['images']:                       # фото-пост: видео не нужно
+        return info
+
+    video_info = (page_json or {}).get('video') or {}
+    video_url = (captured.get('video') or video_info.get('playAddr')
+                 or video_info.get('downloadAddr'))
     if not video_url:
-        raise Exception('Playwright не нашёл прямую ссылку на видео '
-                        '(вероятно, гео-блок — настройте PROXY на нужный регион)')
+        raise Exception('Playwright не нашёл ни видео, ни фотографий '
+                        '(капча или гео-блок — настройте PROXY на нужный регион)')
+    info['downloads']['video'] = video_url
+    return info
 
-    author = page_json.get('author') or {}
-    music = page_json.get('music') or {}
-    stats = page_json.get('stats') or {}
-    video_meta = page_json.get('video') or {}
-    # CDN TikTok отдаёт видео только с правильным Referer/UA — без них
-    # прямое скачивание requests'ом за пределами браузера вернёт 403.
-    # А если гео-блок именно на уровне CDN (не только страницы), скачивать
-    # тоже придётся через тот же PROXY, что и саму страницу.
-    fetch_headers = {'User-Agent': UA, 'Referer': 'https://www.tiktok.com/'}
-    return {
-        'title': page_json.get('desc'),
-        'author': author.get('nickname'),
-        'author_url': (f"https://www.tiktok.com/@{author.get('uniqueId')}"
-                      if author.get('uniqueId') else None),
-        'video_id': str(page_json.get('id') or slug_from_url(url) or 'tiktok'),
-        'duration': video_meta.get('duration'),
-        'views': stats.get('playCount'),
-        'likes': stats.get('diggCount'),
-        'cover': video_meta.get('cover'),
-        'date_str': None,
-        'downloads': {'video': video_url, 'hd': None,
-                      'audio': music.get('playUrl'), 'music': music.get('playUrl')},
-        'sizes': {},
-        'fetch_headers': fetch_headers,
-        'fetch_via_proxy': bool(PROXY),
-    }
+def prov_playwright_tiktok(url):
+    last = None
+    for u in tiktok_url_variants(url):
+        try:
+            return _tt_playwright_once(u)
+        except Exception as e:
+            last = e
+            if 'не установлен' in str(e):
+                break
+    raise last
 
-TIKTOK_PROVIDERS = (prov_tikwm, prov_tiklydown, prov_cobalt, prov_playwright_tiktok)
+# Порядок: HTML (быстро, без браузера) -> tikwm -> cobalt (живые инстансы) -> Playwright.
+# tiklydown убран: домен с неверным сертификатом, проект не обновлялся 2+ года.
+TIKTOK_PROVIDERS = (prov_tiktok_html, prov_tikwm, prov_cobalt, prov_playwright_tiktok)
 
 def get_tiktok_info(url):
     errors = []
     for prov in TIKTOK_PROVIDERS:
+        # (HTML-провайдер пробуем всегда: по URL не отличить фото-пост от видео —
+        # TikTok отдаёт фото-посты и по /video/-адресу.)
         try:
             data = prov(url)
-            if data and data['downloads'].get('video'):
+            if data and (data['downloads'].get('video') or data.get('images')):
                 logger.info("TikTok: сработал провайдер %s", prov.__name__)
                 return data
+            errors.append(f"{prov.__name__}: пустой ответ")
         except Exception as e:
-            logger.warning("TikTok: провайдер %s отвалился: %s", prov.__name__, e)
-            errors.append(f"{prov.__name__}: {e}")
-    raise Exception("Все провайдеры TikTok недоступны: " + "; ".join(errors))
+            short = str(e)[:200]
+            logger.warning("TikTok: провайдер %s отвалился: %s", prov.__name__, short)
+            errors.append(f"{prov.__name__}: {short}")
+    raise TikTokError("Все провайдеры TikTok недоступны: " + "; ".join(errors))
 
 # ================================================================
 #  BILIBILI: ПРОВАЙДЕР (в обход yt-dlp)
@@ -1579,9 +2840,9 @@ BVID_REGEX = re.compile(r'(BV[0-9A-Za-z]{8,})')
 
 def resolve_bilibili_url(url):
     """Разворачивает короткие ссылки b23.tv в полный URL с BVID."""
-    if 'b23.tv' in url or 'bili2233.cn' in url:
+    if host_matches(url, 'b23.tv', 'bili2233.cn'):
         try:
-            r = requests.head(url, headers=BILI_HEADERS, timeout=15, allow_redirects=True)
+            r = safe_request('HEAD', url, headers=BILI_HEADERS, timeout=15)
             return r.url
         except Exception:
             return url
@@ -1654,7 +2915,7 @@ def get_bilibili_info(url):
 # ---------- BOOSTY ----------
 def get_boosty_meta(url):
     try:
-        r = requests.get(url, headers={'User-Agent': UA}, timeout=30)
+        r = safe_request('GET', url, headers={'User-Agent': UA}, timeout=30)
         h = r.text
 
         def grab(tag):
@@ -1678,11 +2939,11 @@ def get_download_options(choice, video_id, title, lang=None, reporter=None):
     is_audio = choice.startswith('audio_')
     ydl_opts = {
         'format': format_selector_for(choice, lang),
-        'outtmpl': base_path_for(title, video_id) + '.%(ext)s',
+        'outtmpl': base_path_for(title, video_id).replace('%', '%%') + '.%(ext)s',
         'quiet': False,
         'no_warnings': False,
         'ignoreerrors': True,
-        'nocheckcertificate': True,
+        'nocheckcertificate': INSECURE_TLS,
         'extractor_retries': 10,
         'file_access_retries': 10,
         'fragment_retries': 10,
@@ -1690,6 +2951,7 @@ def get_download_options(choice, video_id, title, lang=None, reporter=None):
         'continuedl': True,
         'buffersize': 1024 * 1024,
         'socket_timeout': 120,
+        'max_filesize': MAX_DOWNLOAD_BYTES,
         'extractor_args': YTDL_EXTRACTOR_ARGS,
         'user_agent': UA,
         'postprocessors': [],
@@ -1713,17 +2975,23 @@ def get_video_info(url):
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        'nocheckcertificate': True,
+        'nocheckcertificate': INSECURE_TLS,
         'user_agent': UA,
         'extractor_retries': 5,
         'socket_timeout': 60,
         'extractor_args': YTDL_EXTRACTOR_ARGS,
     }
-    ydl_opts.update(cookies_opts())
+    ydl_opts['extract_flat'] = 'in_playlist'   # плейлисты/каналы не разворачиваем
     if PROXY:
         ydl_opts['proxy'] = PROXY
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    with make_ydl(ydl_opts, url) as ydl:       # cookies — только для YouTube
+        info = ydl.extract_info(url, download=False)
+    if isinstance(info, dict):
+        if info.get('_type') in ('playlist', 'multi_video') or info.get('entries') is not None:
+            raise MediaRejectedError(
+                'Это плейлист, канал или альбом — пришлите ссылку на одно видео.')
+        check_media_allowed(info)
+    return info
 
 # ---------- ПОЙМАТЬ ПОТОК ВРУЧНУЮ (для сайтов, которых yt-dlp не знает) ----------
 # Открывает страницу в headless-браузере и слушает сетевые запросы на
@@ -1763,16 +3031,18 @@ def sniff_media_candidates(url, wait_seconds=25):
     direct_src = None
 
     def _add(u, size=0):
-        if u in seen_urls:
+        if u in seen_urls or len(candidates) >= MAX_SNIFF_CANDIDATES:
             return
         seen_urls.add(u)
         candidates.append({'url': u, 'size': size})
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(**chromium_launch_kwargs())
             context = browser.new_context(user_agent=UA,
-                                           viewport={'width': 1280, 'height': 800})
+                                           viewport={'width': 1280, 'height': 800},
+                                           **CONTEXT_HARDENING_KW)
+            playwright_guard(context)
             page = context.new_page()
 
             def on_response(response):
@@ -1825,6 +3095,14 @@ def sniff_media_candidates(url, wait_seconds=25):
         logger.warning("Sniff-фолбэк упал: %s", e)
         return []
 
+    # Адреса приходят ОТ СТРАНИЦЫ (в т.ч. video.currentSrc) — ей нельзя верить:
+    # непубличные отбрасываем здесь, иначе они ушли бы дальше в yt-dlp.
+    candidates = [c for c in candidates
+                  if is_public_http_url(c['url'], resolve=not PROXY)]
+    seen_urls = {c['url'] for c in candidates}
+    if direct_src and not is_public_http_url(direct_src, resolve=not PROXY):
+        direct_src = None
+
     if direct_src and direct_src in seen_urls:
         candidates.sort(key=lambda c: 0 if c['url'] == direct_src else 1)
     elif direct_src:
@@ -1842,6 +3120,9 @@ def run_ffmpeg_with_progress(cmd_no_output, tmp_out, timeout, on_line=None):
     on_line(строка) на каждой строке прогресса — так конвертация может
     показывать реальный процент вместо просто «подожди». stderr читается
     в отдельном потоке, чтобы не словить дедлок на переполнении пайпа."""
+    for _i, _a in enumerate(cmd_no_output[:-1]):
+        if _a == '-i':
+            _reject_text_playlist(cmd_no_output[_i + 1])
     cmd = cmd_no_output + ['-progress', 'pipe:1', '-nostats', tmp_out]
     logger.info("ffmpeg: %s", ' '.join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1883,7 +3164,7 @@ def convert_src_to(src, key, q, reporter=None):
     on_line = make_ffmpeg_progress_hook(reporter, duration) if (reporter and duration) else None
     last_err = None
     for args in ffmpeg_audio_argsets(key, q):
-        cmd = [FFMPEG_BIN, '-y', '-i', src] + args
+        cmd = [FFMPEG_BIN, '-y'] + FFMPEG_IN_GUARD + ['-i', src] + args
         try:
             rc, stderr_tail = run_ffmpeg_with_progress(cmd, tmp_out, timeout=600, on_line=on_line)
         except subprocess.TimeoutExpired:
@@ -1899,7 +3180,8 @@ def convert_src_to(src, key, q, reporter=None):
             os.remove(tmp_out)
         except OSError:
             pass
-    raise Exception(f'ffmpeg не смог конвертировать: {last_err}')
+    logger.error("ffmpeg не смог конвертировать: %s", last_err)
+    raise Exception('ffmpeg не смог конвертировать файл (подробности в логе бота)')
 
 def convert_video_to(src, key, reporter=None):
     fmt = VIDEO_FORMATS[key]
@@ -1908,7 +3190,7 @@ def convert_video_to(src, key, reporter=None):
     on_line = make_ffmpeg_progress_hook(reporter, duration) if (reporter and duration) else None
     last_err = None
     for args in fmt['args']:
-        cmd = [FFMPEG_BIN, '-y', '-i', src] + args
+        cmd = [FFMPEG_BIN, '-y'] + FFMPEG_IN_GUARD + ['-i', src] + args
         try:
             rc, stderr_tail = run_ffmpeg_with_progress(cmd, tmp_out, timeout=600, on_line=on_line)
         except subprocess.TimeoutExpired:
@@ -1924,7 +3206,8 @@ def convert_video_to(src, key, reporter=None):
             os.remove(tmp_out)
         except OSError:
             pass
-    raise Exception(f'ffmpeg не смог конвертировать видео: {last_err}')
+    logger.error("ffmpeg не смог конвертировать видео: %s", last_err)
+    raise Exception('ffmpeg не смог конвертировать видео (подробности в логе бота)')
 
 def finish_file(tmp_out, title, video_id, key):
     out = base_path_for(title, video_id) + '.' + key
@@ -1951,9 +3234,10 @@ def download_and_convert_audio(url, video_id, title, key, q, lang=None, reporter
             'quiet': True,
             'no_warnings': True,
             'ignoreerrors': False,
-            'nocheckcertificate': True,
+            'nocheckcertificate': INSECURE_TLS,
             'fragment_retries': 10,
             'socket_timeout': 120,
+            'max_filesize': MAX_DOWNLOAD_BYTES,
             'user_agent': UA,
             'extractor_args': YTDL_EXTRACTOR_ARGS,
         }
@@ -1963,13 +3247,20 @@ def download_and_convert_audio(url, video_id, title, key, q, lang=None, reporter
         if PROXY:
             ydl_opts['proxy'] = PROXY
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with make_ydl(ydl_opts, url) as ydl:
                 ydl.extract_info(url, download=True)
             matches = glob.glob(tmp_src + '.*')
             if matches:
                 src = matches[0]
                 logger.info("yt-dlp скачал с форматом: %s -> %s", fmt, src)
                 break
+        except _FATAL_ERRORS:
+            for p in glob.glob(tmp_src + '.*'):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            raise
         except Exception as e:
             last_err = str(e)
             logger.warning("yt-dlp не смог с форматом %s: %s", fmt, e)
@@ -2194,10 +3485,10 @@ def save_sent_cache():
         logger.warning("Не удалось сохранить кэш: %s", e)
 
 def is_cached(video_id, choice):
-    return bool(video_id) and (video_id, choice) in SENT_CACHE
+    return bool(video_id) and not _uncacheable(video_id) and (video_id, choice) in SENT_CACHE
 
 def store_cached(video_id, choice, message, file_type, caption):
-    if not video_id or not message:
+    if not video_id or not message or choice is None or _uncacheable(video_id):
         return
     fid = None
     actual_type = file_type
@@ -2219,6 +3510,8 @@ def store_cached(video_id, choice, message, file_type, caption):
         save_sent_cache()
 
 def send_from_cache(chat_id, video_id, choice):
+    if _uncacheable(video_id):
+        return None
     c = SENT_CACHE.get((video_id, choice))
     if not c:
         return None
@@ -2322,7 +3615,8 @@ def yt_search(query, limit=8):
         'extract_flat': 'in_playlist', 'noplaylist': True,
         'socket_timeout': 20,
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    query = (query or '')[:200]
+    with make_ydl(opts, None, single=False) as ydl:
         info = ydl.extract_info(f'ytsearch{limit}:{query}', download=False)
     entries = (info or {}).get('entries') or []
     results = []
@@ -2338,77 +3632,244 @@ def yt_search(query, limit=8):
         })
     return results
 
-def yt_search_with_period(query, date_from, date_to, pool=30, need=8):
-    """
-    Гибридный поиск: сначала DuckDuckGo (отлично ищет старые видео по точным датам), 
-    затем добиваем через yt-dlp (если не набрали нужное количество).
-    """
-    matched = []
-    
-    # 1. Попытка найти через DuckDuckGo (работает для старых дат)
-    if HAS_DDGS:
-        start_str = date_from.strftime('%Y-%m-%d')
-        end_str = date_to.strftime('%Y-%m-%d')
-        ddg_query = f"{query} site:youtube.com/watch"
-
-        try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(ddg_query, timelimit=f"{start_str}..{end_str}", max_results=need * 2))
-                for r in results:
-                    if len(matched) >= need:
-                        break
-                    url = r.get('href', '')
-                    match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
-                    if match:
-                        # Проверка на дубликаты
-                        if not any(m['id'] == match.group(1) for m in matched):
-                            matched.append({
-                                'id': match.group(1),
-                                'title': r.get('title') or '(без названия)',
-                                'duration': None,
-                                'channel': None,
-                                'url': url,
-                                'upload_date': None
-                            })
-        except Exception as e:
-            logger.warning("DuckDuckGo поиск не удался: %s", e)
-
-    # 2. Если не набрали нужное количество, добиваем через yt-dlp (для свежих видео)
-    if len(matched) < need:
-        remaining_need = need - len(matched)
-        opts = {
-            'quiet': True, 'no_warnings': True, 'skip_download': True,
-            'extract_flat': False,  # ВАЖНО: собираем даты сразу, без зависаний
-            'noplaylist': True, 'socket_timeout': 15
+def yt_search_api_v3(query, date_from, date_to, limit=8):
+    """Точный поиск по периоду через официальный YouTube Data API v3 —
+    publishedAfter/publishedBefore фильтруют СЕРВЕРНО. Стоимость: 100
+    юнитов на search.list + 1 юнит на videos.list за длительностями —
+    из 10 000/сутки разумная цена для нечастого использования."""
+    if not YOUTUBE_API_KEY:
+        return None
+    try:
+        params = {
+            'key': YOUTUBE_API_KEY, 'part': 'snippet', 'q': query,
+            'type': 'video', 'order': 'relevance', 'maxResults': limit,
+            'publishedAfter': f"{date_from.isoformat()}T00:00:00Z",
+            'publishedBefore': f"{date_to.isoformat()}T23:59:59Z",
         }
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f'ytsearch{remaining_need * 3}:{query}', download=False)
-                entries = (info or {}).get('entries') or []
-                
-                for c in entries:
-                    if len(matched) >= need:
-                        break
-                    if not c or not c.get('id'):
-                        continue
-                    
-                    upload_date = c.get('upload_date')
-                    if upload_date and len(upload_date) == 8:
-                        d = datetime.date(int(upload_date[:4]), int(upload_date[4:6]), int(upload_date[6:8]))
-                        if date_from <= d <= date_to:
-                            if not any(m['id'] == c['id'] for m in matched):
-                                matched.append({
-                                    'id': c['id'],
-                                    'title': c.get('title') or '(без названия)',
-                                    'duration': c.get('duration'),
-                                    'channel': c.get('channel') or c.get('uploader'),
-                                    'url': c.get('url') or f"https://www.youtube.com/watch?v={c['id']}",
-                                    'upload_date': upload_date
-                                })
-        except Exception as e:
-            logger.warning("yt-dlp поиск не удался: %s", e)
+        r = requests.get('https://www.googleapis.com/youtube/v3/search',
+                         params=params, timeout=15)
+        j = r.json()
+        if 'error' in j:
+            logger.warning("YouTube API v3 search вернул ошибку: %s", j['error'])
+            return None
+        items = j.get('items') or []
+        if not items:
+            return []
+        video_ids = [it['id']['videoId'] for it in items if it.get('id', {}).get('videoId')]
+        durations = {}
+        if video_ids:
+            try:
+                r2 = requests.get('https://www.googleapis.com/youtube/v3/videos',
+                                  params={'key': YOUTUBE_API_KEY, 'part': 'contentDetails',
+                                         'id': ','.join(video_ids)}, timeout=15)
+                for v in (r2.json().get('items') or []):
+                    dur_str = v.get('contentDetails', {}).get('duration')
+                    m = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', dur_str or '')
+                    if m:
+                        h, mnt, sec = (int(g) if g else 0 for g in m.groups())
+                        durations[v['id']] = h * 3600 + mnt * 60 + sec
+            except Exception as e:
+                logger.warning("Не удалось получить длительности через API v3: %s", e)
+        results = []
+        for it in items:
+            vid = it.get('id', {}).get('videoId')
+            if not vid:
+                continue
+            sn = it.get('snippet', {})
+            results.append({
+                'id': vid, 'title': sn.get('title') or '(без названия)',
+                'duration': durations.get(vid), 'channel': sn.get('channelTitle'),
+                'url': f"https://www.youtube.com/watch?v={vid}",
+                'upload_date': (sn.get('publishedAt') or '')[:10].replace('-', ''),
+            })
+        return results
+    except Exception as e:
+        logger.warning("YouTube API v3 поиск не удался: %s", e)
+        return None
 
-    return matched
+# ================================================================
+#  СВОЙ ИНСТРУМЕНТ ПОИСКА ПО ПЕРИОДУ (в обход yt-dlp)
+# ================================================================
+# yt-dlp сам сломал и выпилил `ytsearchdate:` в феврале 2026 (YouTube
+# что-то поменял на своей стороне, разработчики решили не чинить —
+# https://github.com/yt-dlp/yt-dlp/issues/15898). Раз готового решения
+# больше нет — разбираем страницу выдачи YouTube напрямую сами.
+_RELATIVE_DATE_RE = re.compile(r'(\d+)\s+(hour|day|week|month|year)s?\s+ago', re.I)
+_DAYS_PER_UNIT = {'hour': 0, 'day': 1, 'week': 7, 'month': 30, 'year': 365}
+
+def _parse_relative_date(text, today):
+    """'2 years ago' / '5 months ago' и т.п. -> приблизительная date.
+    Точность естественно грубая (YouTube и сам округляет "2 года назад"
+    для диапазона в пару месяцев), но для фильтра по периоду достаточно."""
+    if not text:
+        return None
+    m = _RELATIVE_DATE_RE.search(text)
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2).lower()
+    return today - datetime.timedelta(days=n * _DAYS_PER_UNIT[unit])
+
+_INNERTUBE_API_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8'  # публичный ключ WEB-клиента youtube.com, без отношения к вашим Google Cloud квотам
+
+def _walk_video_renderers(obj):
+    """Обход JSON-дерева YouTube в поисках videoRenderer-блоков и токена
+    продолжения (continuation) — общая логика для страницы 1 (HTML) и
+    последующих страниц (внутренний JSON-API)."""
+    videos, continuation = [], None
+    def _walk(node):
+        nonlocal continuation
+        if isinstance(node, dict):
+            if 'videoRenderer' in node:
+                videos.append(node['videoRenderer'])
+            if 'continuationCommand' in node:
+                tok = node['continuationCommand'].get('token')
+                if tok:
+                    continuation = tok
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v)
+    _walk(obj)
+    return videos, continuation
+
+def _parse_video_renderer(vr, today):
+    vid = vr.get('videoId')
+    if not vid:
+        return None
+    title = ''.join(t.get('text', '') for t in (vr.get('title', {}).get('runs') or []))
+    channel_runs = (vr.get('ownerText', {}) or {}).get('runs') or []
+    channel = channel_runs[0]['text'] if channel_runs else None
+    length_text = (vr.get('lengthText', {}) or {}).get('simpleText')
+    duration = None
+    if length_text:
+        try:
+            parts = [int(p) for p in length_text.split(':')]
+            duration = sum(p * 60 ** i for i, p in enumerate(reversed(parts)))
+        except ValueError:
+            pass
+    published = (vr.get('publishedTimeText', {}) or {}).get('simpleText', '')
+    return {
+        'id': vid, 'title': title or '(без названия)',
+        'duration': duration, 'channel': channel,
+        'url': f"https://www.youtube.com/watch?v={vid}",
+        '_approx_date': _parse_relative_date(published, today),
+    }
+
+def _scrape_yt_search_page(query, sp='CAI%3D', max_pages=6):
+    """Запрос(ы) к выдаче YouTube напрямую (без yt-dlp), С ПАГИНАЦИЕЙ —
+    первая страница обычным HTML (ytInitialData), следующие — через тот
+    же внутренний JSON-API, которым пользуется сама страница (продолжение
+    по continuation-токену).
+
+    ЧЕСТНО: sp=CAI%3D раньше означал «сортировать по дате загрузки», но
+    YouTube в феврале 2026 закрыла и эту лазейку (после того как в январе
+    2026 убрала сортировку по дате из интерфейса вообще, переименовав
+    «Sort By» в «Prioritize») — подтверждено репортами в Reddit и
+    отдельной статьёй с апдейтом в тот же день. Сейчас этот параметр
+    просто убирает верхнее меню фильтров, а выдача остаётся в обычном
+    алгоритмическом порядке. Так что реальной хронологии тут больше нет —
+    единственное, что нам осталось: набирать МНОГО кандидатов (отсюда и
+    max_pages) и полагаться на подмешанный в запрос год (см.
+    yt_search_custom_by_date), чтобы старое видео просто с большей
+    вероятностью попало в выдачу по тексту. Это принципиальное
+    ограничение на стороне YouTube, а не наш баг — почини его нельзя,
+    можно только компенсировать объёмом."""
+    headers = {'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9'}
+    today = datetime.date.today()
+    out = []
+
+    url = f"https://www.youtube.com/results?search_query={quote(query)}&sp={sp}"
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    m = (re.search(r'var ytInitialData\s*=\s*(\{.*?\});</script>', r.text) or
+         re.search(r'var ytInitialData\s*=\s*(\{.*?\});', r.text))
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return []
+    videos, continuation = _walk_video_renderers(data)
+    out.extend(item for item in (_parse_video_renderer(vr, today) for vr in videos) if item)
+
+    api_key_match = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', r.text)
+    api_key = api_key_match.group(1) if api_key_match else _INNERTUBE_API_KEY
+    for _ in range(max_pages - 1):
+        if not continuation:
+            break
+        try:
+            r2 = requests.post(
+                'https://www.youtube.com/youtubei/v1/search',
+                params={'key': api_key},
+                json={'context': {'client': {'clientName': 'WEB',
+                                             'clientVersion': '2.20240101.00.00'}},
+                     'continuation': continuation},
+                headers={'User-Agent': UA, 'Content-Type': 'application/json'},
+                timeout=20)
+            r2.raise_for_status()
+            videos, continuation = _walk_video_renderers(r2.json())
+        except Exception as e:
+            logger.warning("Не удалось получить следующую страницу выдачи: %s", e)
+            break
+        if not videos:
+            break
+        out.extend(item for item in (_parse_video_renderer(vr, today) for vr in videos) if item)
+    return out
+
+def yt_search_custom_by_date(query, date_from, date_to, need=40):
+    """Свой поиск по периоду поверх _scrape_yt_search_page.
+
+    Сортировки по дате от YouTube больше нет вообще (см. комментарий в
+    _scrape_yt_search_page) — единственный оставшийся рычаг: подмешиваем
+    нужный год прямо в текст запроса ("roblox 2012", "roblox 2013"...).
+    YouTube находит ролики, текстово привязанные к нужному году, а сверка
+    распарсенной приблизительной даты уже отсеивает случайные совпадения
+    (например ролик 2024 года с "2012" просто в названии). Полной
+    гарантии найти вообще всё подходящее видео это не даёт — это
+    компенсация отсутствия сортировки объёмом и текстовым намёком, а не
+    точный фильтр.
+
+    Возвращает (найденные_видео, список_подзапросов) — второе нужно,
+    чтобы честно показать человеку, что именно искалось (а не молча
+    подменять его запрос у него за спиной)."""
+    seen = set()
+    matched = []
+    years = list(range(date_from.year, date_to.year + 1))
+    queries = [f"{query} {y}" for y in years] + [query]
+
+    for q in queries:
+        if len(matched) >= need:
+            break
+        try:
+            page = _scrape_yt_search_page(q)
+        except Exception as e:
+            logger.warning("Скрейп поиска YouTube не удался (%r): %s", q, e)
+            continue
+        for item in page:
+            if len(matched) >= need:
+                break
+            if item['id'] in seen:
+                continue
+            d = item.pop('_approx_date')
+            if not d or not (date_from <= d <= date_to):
+                continue
+            seen.add(item['id'])
+            item['upload_date'] = d.strftime('%Y%m%d')
+            matched.append(item)
+    return matched, queries
+
+def yt_search_with_period(query, date_from, date_to, pool=300, need=40):
+    """Сначала точный способ (YouTube Data API v3, если задан ключ). Иначе
+    — свой скрейпер (yt_search_custom_by_date), который не зависит от
+    yt-dlp вообще. DuckDuckGo не используется: у него нет произвольных
+    диапазонов дат, только пресеты день/неделя/месяц/год — для этой
+    задачи он в принципе не подходит, проверено.
+    Возвращает (список_видео, список_подзапросов_или_None)."""
+    api_results = yt_search_api_v3(query, date_from, date_to, limit=need)
+    if api_results is not None:
+        return api_results, None
+    return yt_search_custom_by_date(query, date_from, date_to, need=need)
 
 def build_search_prompt_kb():
     kb = InlineKeyboardMarkup()
@@ -2422,25 +3883,43 @@ def start_search_flow(message, query):
     chat_id = message.chat.id
     sent = bot.reply_to(message, f"🔎 Искать «{esc(query)}» на YouTube?",
                         parse_mode='HTML', reply_markup=build_search_prompt_kb())
-    user_data[(chat_id, sent.message_id)] = {'source': 'search_prompt', 'query': query}
+    user_data[(chat_id, sent.message_id)] = {'source': 'search_prompt', 'query': query,
+                                             'owner': uid_of(message)}
 
-def build_results_kb(items):
+SEARCH_PAGE_SIZE = 5
+
+def build_results_kb(items, page=0):
     kb = InlineKeyboardMarkup()
-    for i, it in enumerate(items):
+    start = page * SEARCH_PAGE_SIZE
+    for i, it in enumerate(items[start:start + SEARCH_PAGE_SIZE]):
+        global_idx = start + i
         label = it['title']
         if len(label) > 50:
             label = label[:50] + '…'
-        kb.row(InlineKeyboardButton(f"{i + 1}. {label}{_fmt_duration(it.get('duration'))}",
-                                    callback_data=f'search_pick_{i}'))
+        kb.row(InlineKeyboardButton(
+            f"{global_idx + 1}. {label}{_fmt_duration(it.get('duration'))}",
+            callback_data=f'search_pick_{global_idx}'))
+    total_pages = max(1, math.ceil(len(items) / SEARCH_PAGE_SIZE))
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f'search_page_{page - 1}'))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data='search_noop'))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f'search_page_{page + 1}'))
+        kb.row(*nav)
     return kb
 
-def send_search_results(chat_id, query, items, message_id=None, note=None):
+def send_search_results(chat_id, query, items, message_id=None, note=None, page=0):
     if not items:
         text = f"😕 По запросу «{esc(query)}» ничего не нашлось."
         kb = None
     else:
-        text = f"🔎 Результаты по «{esc(query)}»:"
-        kb = build_results_kb(items)
+        total = len(items)
+        start = page * SEARCH_PAGE_SIZE + 1
+        end = min(start + SEARCH_PAGE_SIZE - 1, total)
+        text = f"🔎 Результаты по «{esc(query)}» (найдено {total}, показаны {start}-{end}):"
+        kb = build_results_kb(items, page)
     if note:
         text += f"\n{note}"
     msg_id = message_id
@@ -2455,7 +3934,8 @@ def send_search_results(chat_id, query, items, message_id=None, note=None):
         sent = bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
         msg_id = sent.message_id
     if items:
-        user_data[(chat_id, msg_id)] = {'source': 'search_results', 'query': query, 'items': items}
+        user_data[(chat_id, msg_id)] = {'source': 'search_results', 'query': query,
+                                        'items': items, 'page': page}
 
 def build_history_kb(hist):
     kb = InlineKeyboardMarkup()
@@ -2480,7 +3960,7 @@ def build_history_kb(hist):
 # переводит в режим ввода периода, без обычного меню "искать сейчас/...".
 ADV_SEARCH_PREFIX = "🔎 Расширенный поиск:"
 
-_inline_cache = {}          # query (в нижнем регистре) -> (timestamp, results)
+_inline_cache = BoundedDict(500)   # query (в нижнем регистре) -> (timestamp, results); с потолком
 _inline_cache_lock = threading.Lock()
 INLINE_CACHE_TTL = 120      # сек — не бьём YouTube поиском на каждую букву
 INLINE_MIN_LEN = 2
@@ -2490,7 +3970,7 @@ def _inline_thumb(video_id):
 
 @bot.inline_handler(func=lambda q: True)
 def handle_inline_search(inline_query):
-    query = (inline_query.query or '').strip()
+    query = (inline_query.query or '').strip()[:100]
 
     if len(query) < INLINE_MIN_LEN:
         try:
@@ -2500,6 +3980,13 @@ def handle_inline_search(inline_query):
                 switch_pm_parameter="inline_help")
         except Exception as e:
             logger.warning("Не удалось ответить на пустой inline-запрос: %s", e)
+        return
+
+    if _inline_limiter.hit(uid_of(inline_query) or 0):
+        try:
+            bot.answer_inline_query(inline_query.id, [], cache_time=1, is_personal=True)
+        except Exception:
+            pass
         return
 
     key = query.lower()
@@ -2554,7 +4041,8 @@ def probe_video_meta(filename):
     больше не передаются (см. send_file_with_retry), функция оставлена
     как справка и для будущих нужд."""
     try:
-        proc = subprocess.run([FFMPEG_BIN, '-i', filename],
+        _reject_text_playlist(filename)
+        proc = subprocess.run([FFMPEG_BIN] + FFMPEG_IN_GUARD + ['-i', filename],
                               capture_output=True, text=True,
                               errors='replace', timeout=30)
         out = proc.stderr or ''
@@ -2582,7 +4070,8 @@ def probe_video_meta(filename):
 
 def probe_duration_ffmpeg(filename):
     try:
-        proc = subprocess.run([FFMPEG_BIN, '-i', filename],
+        _reject_text_playlist(filename)
+        proc = subprocess.run([FFMPEG_BIN] + FFMPEG_IN_GUARD + ['-i', filename],
                             capture_output=True, text=True,
                             errors='replace', timeout=30)
         m = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.\d+)', proc.stderr or '')
@@ -2597,15 +4086,15 @@ def split_video_file(filename, max_bytes=MAX_PART_BYTES):
     total_size = os.path.getsize(filename)
     if total_size <= max_bytes:
         return [filename]
-    duration = probe_duration_ffmpeg(filename)
+    duration = probe_duration_ffmpeg(filename)   # (внутри — проверка на плейлист)
     if not duration:
         logger.warning("Не удалось разбить файл (нет длительности), отправлю как есть")
         return [filename]
     n_parts = math.ceil(total_size / max_bytes)
     seg_time = max(5, int(duration / n_parts))
     base, ext = os.path.splitext(filename)
-    pattern = f"{base}_part%03d{ext}"
-    cmd = [FFMPEG_BIN, '-y', '-i', filename, '-c', 'copy', '-map', '0',
+    pattern = f"{base.replace('%', '%%')}_part%03d{ext}"
+    cmd = [FFMPEG_BIN, '-y'] + FFMPEG_IN_GUARD + ['-i', filename, '-c', 'copy', '-map', '0',
            '-f', 'segment', '-segment_time', str(seg_time),
            '-reset_timestamps', '1', pattern]
     try:
@@ -2613,7 +4102,7 @@ def split_video_file(filename, max_bytes=MAX_PART_BYTES):
     except Exception as e:
         logger.error("ffmpeg-разбивка не удалась: %s", e)
         return [filename]
-    parts = sorted(glob.glob(f"{base}_part*{ext}"))
+    parts = sorted(glob.glob(f"{glob.escape(base)}_part*{ext}"))
     return parts if parts else [filename]
 
 def send_video_smart(chat_id, filename, file_type, base_caption,
@@ -2622,6 +4111,9 @@ def send_video_smart(chat_id, filename, file_type, base_caption,
     """Отправляет файл; если видео > 2 ГБ — режет на части через ffmpeg
     (без перекодирования) и шлёт по очереди. Кэширует file_id для
     «мгновенного видео», только если файл уместился в одну часть."""
+    if file_type == 'video' and \
+            os.path.splitext(filename)[1].lstrip('.').lower() in AUDIO_EXTS:
+        file_type = 'audio'  # звук нельзя слать как видео (.mp3 под видом .mp4)
     parts = split_video_file(filename) if file_type == 'video' else [filename]
     sent_last = None
     try:
@@ -2651,22 +4143,26 @@ def download_with_fallback(url, video_id, title, chat_id, status_msg, lang=None)
     for q in ('480p', '360p'):
         try:
             reporter = ProgressReporter(chat_id, status_msg.message_id, f"⏳ Пробую {q}")
-            with yt_dlp.YoutubeDL(get_download_options(q, video_id, title, lang,
-                                                        reporter=reporter)) as ydl:
+            with make_ydl(get_download_options(q, video_id, title, lang,
+                                               reporter=reporter), url) as ydl:
                 ydl.extract_info(url, download=True)
             filename = find_downloaded_file(base_path_for(title, video_id))
             if filename and os.path.getsize(filename) > 0:
                 return filename, q
+        except _FATAL_ERRORS:
+            raise
         except Exception as e:
             logger.warning("Не удалось скачать %s: %s", q, e)
     try:
         reporter = ProgressReporter(chat_id, status_msg.message_id, "⏳ Пробую аудио")
-        with yt_dlp.YoutubeDL(get_download_options('audio_192', video_id, title, lang,
-                                                    reporter=reporter)) as ydl:
+        with make_ydl(get_download_options('audio_192', video_id, title, lang,
+                                           reporter=reporter), url) as ydl:
             ydl.extract_info(url, download=True)
         filename = find_downloaded_file(base_path_for(title, video_id))
         if filename and os.path.getsize(filename) > 0:
             return filename, 'audio_192'
+    except _FATAL_ERRORS:
+        raise
     except Exception as e:
         logger.error("Не удалось скачать аудио: %s", e)
 
@@ -2678,11 +4174,13 @@ def download_with_fallback(url, video_id, title, chat_id, status_msg, lang=None)
                               chat_id=chat_id, message_id=status_msg.message_id)
         opts = get_download_options('720p', video_id, title)
         opts['format'] = 'best'
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with make_ydl(opts, url) as ydl:
             ydl.extract_info(url, download=True)
         filename = find_downloaded_file(base_path_for(title, video_id))
         if filename and os.path.getsize(filename) > 0:
             return filename, 'best'
+    except _FATAL_ERRORS:
+        raise
     except Exception as e:
         logger.error("Не удалось скачать даже с form=best: %s", e)
 
@@ -2693,7 +4191,7 @@ def download_with_fallback(url, video_id, title, chat_id, status_msg, lang=None)
     try:
         bot.edit_message_text("⏳ Пробую через внешний API-загрузчик (Cobalt)...",
                               chat_id=chat_id, message_id=status_msg.message_id)
-        direct_url = cobalt_direct_url(url, service_hint='vimeo' if 'vimeo.com' in url else None)
+        direct_url = cobalt_direct_url(url, service_hint='vimeo' if host_matches(url, 'vimeo.com') else None)
         dest = base_path_for(title, video_id) + '.mp4'
         download_direct_headers(direct_url, dest, {'User-Agent': UA})
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
@@ -2707,7 +4205,7 @@ def download_with_fallback(url, video_id, title, chat_id, status_msg, lang=None)
 def send_tiktok_card(message, url, placeholder):
     d = get_tiktok_info(url)
     chat_id = message.chat.id
-    title = (d.get('title') or 'TikTok видео').strip()
+    title = (d.get('title') or ('TikTok фото' if d.get('images') else 'TikTok видео')).strip()
 
     lines = []
     if d.get('author'):
@@ -2722,9 +4220,11 @@ def send_tiktok_card(message, url, placeholder):
     meta = []
     if d.get('date_str'):
         meta.append(f"📅 {d['date_str']}")
-    dur = format_duration(d.get('duration'))
+    dur = None if d.get('images') else format_duration(d.get('duration'))
     if dur:
         meta.append(f"⏱ {dur}")
+    if d.get('images'):
+        meta.append(f"🖼 {len(d['images'])} фото")
     if meta:
         lines.append('  '.join(meta))
 
@@ -2746,7 +4246,7 @@ def send_tiktok_card(message, url, placeholder):
         'source': 'tiktok',
         'url': url,
         'title': title,
-        'video_id': d.get('video_id') or 'tiktok',
+        'video_id': ns_id('tiktok', d.get('video_id') or 'tiktok'),
         'tiktok': d,
     }
     kb = build_video_kb(data)
@@ -2770,10 +4270,17 @@ def handle_tiktok(call, data):
     choice = call.data
     chat_id = call.message.chat.id
     field, ftype, qlabel = TT_CHOICES[choice]
+    is_photos = (choice == 'tt_photos')
+    is_show = bool(data['tiktok'].get('images')) and ftype == 'video'
     dl_url = data['tiktok']['downloads'].get(field)
-    if not dl_url:
+    if is_photos and not data['tiktok'].get('images'):
+        bot.answer_callback_query(call.id, "❌ У этого поста нет фото.")
+        return
+    if not dl_url and not is_show and not is_photos:
         bot.answer_callback_query(call.id, "❌ Этот вариант недоступен.")
         return
+    if is_show:
+        qlabel = f"Слайд-шоу ({len(data['tiktok']['images'])} фото)"
 
     bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
     safe_answer_callback(call, "⏳ Загрузка...")
@@ -2784,9 +4291,34 @@ def handle_tiktok(call, data):
     thumb_path = None
 
     try:
-        download_tiktok_url(dl_url, filename, data['tiktok'])
+        if is_photos:
+            try:
+                bot.edit_message_text("🖼 Скачиваю фото...",
+                                      chat_id=chat_id, message_id=status_msg.message_id)
+            except Exception:
+                pass
+            n = len(data['tiktok']['images'])
+            short = dict(data)
+            short['title'] = (data['title'] or '')[:200]
+            cap = build_final_caption(short, 0, f"Фото: {n} шт.")
+            cap = re.sub(r"📦 [^\n]*\n", "", cap)          # размера у альбома нет
+            if len(cap) > TG_CAPTION_LIMIT:
+                cap = f"🖼 <b>{esc(short['title'][:150])}</b> {arrow_link(data['url'])}"
+            sent = send_tiktok_photos(chat_id, data['tiktok'], cap)
+            bot.delete_message(chat_id, status_msg.message_id)
+            return
+        if is_show:
+            try:
+                bot.edit_message_text("🖼 Собираю слайд-шоу из фото...",
+                                      chat_id=chat_id, message_id=status_msg.message_id)
+            except Exception:
+                pass
+            build_tiktok_slideshow(data['tiktok'], filename)
+        else:
+            download_tiktok_url(dl_url, filename, data['tiktok'])
         file_size = os.path.getsize(filename)
-        cap = build_final_caption(data, file_size, f"Качество: {qlabel}")
+        cap = build_final_caption(data, file_size,
+                                  qlabel if is_show else f"Качество: {qlabel}")
         raw_thumb = download_thumbnail(get_thumbnail_url(data), data['video_id'])
         vid_w, vid_h, _ = probe_video_meta(filename) if ftype == 'video' else (None, None, None)
         thumb_path = make_telegram_video_thumb(raw_thumb, data['video_id'], vid_w, vid_h)
@@ -2798,7 +4330,7 @@ def handle_tiktok(call, data):
         bot.delete_message(chat_id, status_msg.message_id)
     except Exception as e:
         logger.error("Ошибка TikTok: %s", e)
-        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+        bot.send_message(chat_id, f"❌ Ошибка: {public_error(e)}")
     finally:
         if thumb_path and os.path.exists(thumb_path):
             os.remove(thumb_path)
@@ -2851,7 +4383,7 @@ def send_bilibili_card(message, url, placeholder):
         'source': 'bilibili',
         'url': url,
         'title': title,
-        'video_id': d.get('video_id') or 'bilibili',
+        'video_id': ns_id('bili', d.get('video_id') or 'bilibili'),
         'bilibili': d,
     }
     kb = build_video_kb(data)
@@ -2953,7 +4485,7 @@ def send_vimeo_card(chat_id, url, placeholder_message_id):
             'source': 'vimeo_direct',
             'url': url,
             'title': title,
-            'video_id': video_id,
+            'video_id': ns_id('vimeo', video_id),
             'vimeo_direct': info,
         }
         kb = build_video_kb(data)
@@ -3034,7 +4566,7 @@ def send_vimeo_cobalt_card(chat_id, url, placeholder_message_id):
         'source': 'vimeo_cobalt',
         'url': url,
         'title': title,
-        'video_id': video_id,
+        'video_id': ns_id('vimeo', video_id),
         'vimeo_cobalt': {'cover': None},
     }
     kb = build_video_kb(data)
@@ -3081,7 +4613,7 @@ def handle_vimeo_cobalt_download(call, data):
         bot.delete_message(chat_id, status_msg.message_id)
     except Exception as e:
         logger.error("Ошибка Vimeo/Cobalt: %s", e)
-        bot.send_message(chat_id, f"❌ Не удалось скачать через Cobalt: {e}")
+        bot.send_message(chat_id, f"❌ Не удалось скачать через Cobalt: {public_error(e)}")
     finally:
         if thumb_path and os.path.exists(thumb_path):
             os.remove(thumb_path)
@@ -3109,7 +4641,10 @@ def handle_bilibili_download(call, data):
         if play['mode'] == 'dash' and play.get('audio_url'):
             download_direct_headers(play['video_url'], tmp_video, BILI_HEADERS)
             download_direct_headers(play['audio_url'], tmp_audio, BILI_HEADERS)
-            cmd = [FFMPEG_BIN, '-y', '-i', tmp_video, '-i', tmp_audio,
+            _reject_text_playlist(tmp_video)
+            _reject_text_playlist(tmp_audio)
+            cmd = [FFMPEG_BIN, '-y'] + FFMPEG_IN_GUARD + ['-i', tmp_video] \
+                + FFMPEG_IN_GUARD + ['-i', tmp_audio,
                    '-c', 'copy', filename]
             subprocess.run(cmd, check=True, capture_output=True)
         else:
@@ -3129,7 +4664,7 @@ def handle_bilibili_download(call, data):
         bot.delete_message(chat_id, status_msg.message_id)
     except Exception as e:
         logger.error("Ошибка Bilibili: %s", e)
-        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+        bot.send_message(chat_id, f"❌ Ошибка: {public_error(e)}")
     finally:
         if thumb_path and os.path.exists(thumb_path):
             os.remove(thumb_path)
@@ -3164,15 +4699,19 @@ def handle_video_format_download(call, data, key, q, lang=None):
         tmp_src = os.path.join(DOWNLOAD_DIR, f"tmp_vsrc_{uuid.uuid4().hex}")
 
         if data.get('source') == 'tiktok':
-            dl_url = data['tiktok']['downloads'].get('video')
-            if not dl_url:
-                raise Exception('TikTok: нет ссылки на видео')
             tmp_src_final = tmp_src + '.mp4'
-            download_tiktok_url(dl_url, tmp_src_final, data['tiktok'])
+            if data['tiktok'].get('images'):
+                reporter.prefix = "🖼 Собираю слайд-шоу"
+                build_tiktok_slideshow(data['tiktok'], tmp_src_final)
+            else:
+                dl_url = data['tiktok']['downloads'].get('video')
+                if not dl_url:
+                    raise Exception('TikTok: нет ссылки на видео')
+                download_tiktok_url(dl_url, tmp_src_final, data['tiktok'])
         else:
             ydl_opts = get_download_options(q, video_id, title, lang, reporter=reporter)
             ydl_opts['outtmpl'] = tmp_src + '.%(ext)s'
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with make_ydl(ydl_opts, data['url']) as ydl:
                 ydl.extract_info(data['url'], download=True)
             matches = glob.glob(tmp_src + '.*')
             if not matches:
@@ -3237,7 +4776,7 @@ def handle_video_format_download(call, data, key, q, lang=None):
         bot.delete_message(chat_id, status_msg.message_id)
     except Exception as e:
         logger.error("Ошибка видеоформата: %s", e)
-        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+        bot.send_message(chat_id, f"❌ Ошибка: {public_error(e)}")
     finally:
         if thumb_path and os.path.exists(thumb_path):
             os.remove(thumb_path)
@@ -3302,7 +4841,7 @@ def handle_audio_download(call, data, key, q, lang=None):
         bot.delete_message(chat_id, status_msg.message_id)
     except Exception as e:
         logger.error("Ошибка аудио: %s", e)
-        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+        bot.send_message(chat_id, f"❌ Ошибка: {public_error(e)}")
     finally:
         if thumb_path and os.path.exists(thumb_path):
             os.remove(thumb_path)
@@ -3395,7 +4934,7 @@ def handle_subtitle_download(call, data, lang_code):
             'quiet': True,
             'no_warnings': False,
             'logger': _CaptureLogger(),
-            'nocheckcertificate': True,
+            'nocheckcertificate': INSECURE_TLS,
             'socket_timeout': 60,
             'user_agent': UA,
             'extractor_args': YTDL_EXTRACTOR_ARGS,
@@ -3405,7 +4944,7 @@ def handle_subtitle_download(call, data, lang_code):
             ydl_opts['proxy'] = PROXY
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with make_ydl(ydl_opts, url) as ydl:
                 ydl.extract_info(url, download=True)
             matches = glob.glob(tmp_base + '.*')
             if matches:
@@ -3421,7 +4960,7 @@ def handle_subtitle_download(call, data, lang_code):
             else:
                 msg = "❌ Не удалось скачать субтитры для этого языка."
             if transcript_api_error:
-                msg += f"\n\nПодробности: {esc(transcript_api_error)}"
+                msg += f"\n\nПодробности: {esc(public_error(transcript_api_error))}"
             bot.send_message(chat_id, msg, parse_mode='HTML')
             return
 
@@ -3433,7 +4972,7 @@ def handle_subtitle_download(call, data, lang_code):
         store_cached(video_id, f"sub_{lang_code}", sent, 'document', cap)
     except Exception as e:
         logger.error("Ошибка отправки субтитров: %s", e)
-        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+        bot.send_message(chat_id, f"❌ Ошибка: {public_error(e)}")
     finally:
         if filename and os.path.exists(filename):
             os.remove(filename)
@@ -3454,6 +4993,9 @@ def send_welcome(message):
 
 @bot.message_handler(commands=['search'])
 def cmd_search(message):
+    if _search_limiter.hit(uid_of(message) or message.chat.id):
+        bot.reply_to(message, "🚦 Слишком много поисковых запросов, подождите минуту.")
+        return
     parts = (message.text or '').split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(message, "Использование: <code>/search запрос</code>\n"
@@ -3468,7 +5010,10 @@ def handle_adv_search_marker(message):
     меню «искать сейчас / указать период / история», раз человек уже явно
     выбрал именно расширенный (по датам) поиск."""
     chat_id = message.chat.id
-    query = message.text[len(ADV_SEARCH_PREFIX):].strip()
+    if _search_limiter.hit(uid_of(message) or chat_id):
+        bot.reply_to(message, "🚦 Слишком много поисковых запросов, подождите минуту.")
+        return
+    query = message.text[len(ADV_SEARCH_PREFIX):].strip()[:200]
     if not query:
         bot.reply_to(message, "❌ Не понял запрос для расширенного поиска.")
         return
@@ -3505,10 +5050,11 @@ def handle_url(message):
         finally:
             finish_job(job_key)
 
-    if not enqueue_job(_run):
+    if not enqueue_job(_run, owner=uid_of(message)):
         finish_job(job_key)
         try:
-            bot.edit_message_text("🚦 Бот сейчас перегружен запросами, попробуйте через минуту.",
+            bot.edit_message_text("🚦 Бот перегружен или у вас уже запущено максимум задач. "
+                                  "Попробуйте через минуту.",
                                   chat_id=chat_id, message_id=placeholder.message_id)
         except Exception:
             pass
@@ -3528,10 +5074,21 @@ def build_and_send_ytdlp_card(chat_id, url, info, placeholder_message_id=None,
     (тогда sniff_candidates/sniff_orig_url прокидываются дальше, чтобы на
     карточке была кнопка «попробовать другой поток» без повторного скана)."""
     chat_id_int = chat_id
-    video_id = info.get('id') or slug_from_url(url) or 'unknown'
+    raw_id = info.get('id') or slug_from_url(url) or 'unknown'
+    # Ключ кэша file_id: id ролика БЕЗ привязки к источнику позволял чужому сайту
+    # подсунуть (id чужого видео) и получить из кэша файл от имени бота.
+    # YouTube — как раньше; прочие экстракторы — с префиксом; generic и sniff
+    # (id берётся из имени файла в URL) — вообще без кэша.
+    _ek = (info.get('extractor_key') or '').lower()
+    if _ek == 'youtube':
+        video_id = raw_id
+    elif _ek in ('', 'generic') or sniff_candidates or sniff_orig_url:
+        video_id = f"nc-{uuid.uuid4().hex[:12]}"
+    else:
+        video_id = ns_id(_ek, raw_id)
     title = info.get('title') or ''
     description = info.get('description') or ''
-    if 'boosty.to' in url:
+    if host_matches(url, 'boosty.to'):
         b_title, b_desc = get_boosty_meta(url)
         if b_title and title.strip().lower() in ('', 'video'):
             title = b_title
@@ -3660,13 +5217,17 @@ def resolve_sniff_pick(chat_id, chosen_url, all_candidates=None, orig_url=None):
         logger.error("Не удалось получить инфо о выбранном потоке: %s", e)
         err_text = re.sub(r'\x1b\[[0-9;]*m', '', str(e))
         try:
-            bot.edit_message_text(f"❌ Ошибка: {err_text}",
+            bot.edit_message_text(f"❌ Ошибка: {public_error(err_text)}",
                                   chat_id=chat_id, message_id=status.message_id)
         except Exception:
             pass
 
 def process_url_message(message, url, placeholder):
     chat_id = message.chat.id
+    if not is_public_http_url(url):
+        bot.edit_message_text("🚫 Эта ссылка не подходит (не публичный адрес).",
+                              chat_id=chat_id, message_id=placeholder.message_id)
+        return
     # У TikTok/Bilibili уже есть собственный, куда более точный пайплайн
     # провайдеров. Общий sniff-фолбэк ниже создавался для сайтов, которые
     # yt-dlp вообще не знает, и слепо хватает первый попавшийся .mp4 в
@@ -3675,18 +5236,22 @@ def process_url_message(message, url, placeholder):
     # видео и отправить его пользователю как будто это успех. Поэтому для
     # этих доменов, если специализированный путь не сработал, сразу
     # показываем настоящую ошибку, а не гадаем через generic sniff.
-    known_platform = ('tiktok.com' in url or 'bilibili.com' in url
-                      or 'b23.tv' in url or 'bili2233.cn' in url)
+    known_platform = host_matches(url, 'tiktok.com', 'bilibili.com', 'b23.tv', 'bili2233.cn')
 
     try:
-        if 'tiktok.com' in url:
+        if host_matches(url, 'tiktok.com'):
             try:
                 send_tiktok_card(message, url, placeholder)
                 return
             except Exception as e:
+                if tiktok_is_photo_url(url):
+                    # yt-dlp не умеет фото-посты ("Unsupported URL") — пробовать
+                    # его нет смысла, показываем настоящую причину.
+                    logger.warning("Провайдеры TikTok не справились с фото-постом: %s", e)
+                    raise TikTokError(str(e))
                 logger.warning("Провайдеры TikTok не справились, пробую yt-dlp: %s", e)
 
-        if 'bilibili.com' in url or 'b23.tv' in url or 'bili2233.cn' in url:
+        if host_matches(url, 'bilibili.com', 'b23.tv', 'bili2233.cn'):
             try:
                 send_bilibili_card(message, url, placeholder)
                 return
@@ -3702,7 +5267,7 @@ def process_url_message(message, url, placeholder):
         # него нередко спокойно достаёт HLS/DASH-манифесты там, где обычная
         # ссылка не сработала. Подменяем ссылку заранее и по-тихому — не
         # заставляем пользователя вручную копировать embed-код.
-        if 'vimeo.com' in url and 'player.vimeo.com' not in url:
+        if host_matches(url, 'vimeo.com') and not host_matches(url, 'player.vimeo.com'):
             embed_url = vimeo_embed_url(url)
             if embed_url:
                 try:
@@ -3727,7 +5292,7 @@ def process_url_message(message, url, placeholder):
         # рискует поймать декоративный мусор плеера), пробуем прямой конфиг
         # плеера Vimeo (send_vimeo_card — тот же метод, что использует сам
         # официальный плеер), а если и он не сработал — Cobalt как посредник.
-        if 'vimeo.com' in url:
+        if host_matches(url, 'vimeo.com'):
             try:
                 send_vimeo_card(chat_id, url, placeholder.message_id)
                 return
@@ -3769,7 +5334,12 @@ def process_url_message(message, url, placeholder):
         # Telegram выглядят как мусор — вырезаем их.
         err_text = re.sub(r'\x1b\[[0-9;]*m', '', err_text)
 
-        if 'Unsupported URL' in err_text:
+        if isinstance(e, TikTokError) or (host_matches(url, 'tiktok.com')
+                                          and 'Unsupported URL' in err_text):
+            friendly = ("❌ Не удалось получить пост TikTok: сервисы-загрузчики сейчас "
+                        "недоступны или блокируют сервер бота (подробности — в логе). "
+                        "Попробуйте через минуту; если повторяется — задайте PROXY.")
+        elif 'Unsupported URL' in err_text:
             friendly = ("❌ Этот сайт не поддерживается загрузчиком (yt-dlp "
                         "не знает, как его скачивать).")
         elif 'impersonation' in err_text.lower():
@@ -3777,7 +5347,7 @@ def process_url_message(message, url, placeholder):
                         "На сервере нужно установить пакет curl_cffi "
                         "(pip install curl_cffi) и перезапустить бота.")
         else:
-            friendly = f"❌ Ошибка: {err_text}"
+            friendly = f"❌ Ошибка: {public_error(err_text)}"
 
         try:
             bot.edit_message_text(friendly,
@@ -3787,6 +5357,17 @@ def process_url_message(message, url, placeholder):
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_quality_choice(call):
+    uid = uid_of(call)
+    if _cb_limiter.hit(uid if uid is not None else call.message.chat.id):
+        safe_answer_callback(call, "🚦 Слишком часто, подождите секунду.")
+        return
+    _tls.owner = uid          # карточки, созданные в этом обработчике, запомнят владельца
+    try:
+        _handle_quality_choice(call)
+    finally:
+        _tls.owner = None
+
+def _handle_quality_choice(call):
     logger.info(">>> Кнопка '%s' от %s", call.data, call.from_user.id)
     chat_id = call.message.chat.id
     choice = call.data
@@ -3795,11 +5376,27 @@ def handle_quality_choice(call):
     # состояний (search_prompt/search_results/search_history) и не имеют
     # отношения к video_id/download-логике ниже, поэтому разбираем их
     # отдельно, сразу после чтения choice/chat_id.
-    if choice in ('search_now', 'search_period', 'search_hist', 'search_cancel') \
-            or choice.startswith('search_pick_') or choice.startswith('search_hist_'):
+    if choice in ('search_now', 'search_period', 'search_hist', 'search_cancel', 'search_noop') \
+            or choice.startswith('search_pick_') or choice.startswith('search_hist_') \
+            or choice.startswith('search_page_'):
         data = user_data.get((chat_id, call.message.message_id))
         if not data:
             safe_answer_callback(call, "❌ Устарело, начните поиск заново.")
+            return
+        if owner_denied(call, data):
+            return
+
+        if choice == 'search_noop':
+            safe_answer_callback(call)
+            return
+
+        if choice.startswith('search_page_'):
+            page = int(choice.split('_')[-1])
+            items = data.get('items') or []
+            query = data.get('query') or ''
+            safe_answer_callback(call)
+            send_search_results(chat_id, query, items,
+                                message_id=call.message.message_id, page=page)
             return
 
         if choice == 'search_cancel':
@@ -3814,6 +5411,10 @@ def handle_quality_choice(call):
             return
 
         if choice == 'search_now':
+            if _search_limiter.hit(uid_of(call) or chat_id):
+                safe_answer_callback(call, "🚦 Слишком много поисковых запросов, подождите минуту.",
+                                     show_alert=True)
+                return
             query = data.get('query')
             safe_answer_callback(call, "⏳ Ищу...")
             bot.edit_message_text(f"⏳ Ищу «{esc(query)}»...", chat_id=chat_id,
@@ -3826,12 +5427,13 @@ def handle_quality_choice(call):
                 except Exception as e:
                     logger.error("Ошибка поиска: %s", e)
                     try:
-                        bot.edit_message_text(f"❌ Ошибка поиска: {e}",
+                        bot.edit_message_text(f"❌ Ошибка поиска: {public_error(e)}",
                                               chat_id=chat_id, message_id=mid)
                     except Exception:
                         pass
-            if not enqueue_job(_run):
-                bot.edit_message_text("🚦 Бот перегружен, попробуйте позже.",
+            if not enqueue_job(_run, owner=uid_of(call)):
+                bot.edit_message_text("🚦 Бот перегружен или у вас уже запущено максимум задач. "
+                                      "Попробуйте позже.",
                                       chat_id=chat_id, message_id=call.message.message_id)
             return
 
@@ -3842,10 +5444,11 @@ def handle_quality_choice(call):
                 f"📅 За какой период искать «{esc(query)}»?\n"
                 f"Напишите в формате <code>01.01.2012-01.01.2013</code> "
                 f"(или просто годами: <code>2012-2013</code>).\n\n"
-                f"⚠️ Учтите: YouTube не отдаёт дату видео в общей выдаче, поэтому "
-                f"даты проверяются по одному видео за раз в пределах ограниченного "
-                f"пула — это не мгновенно и не гарантирует все подходящие видео "
-                f"из всей истории YouTube, только из первых результатов поиска.",
+                f"⚠️ Учтите: в 2026 YouTube убрала сортировку по дате загрузки "
+                f"из поиска совсем (и из интерфейса, и из скрытых параметров) — "
+                f"поэтому поиск по периоду не гарантирует найти вообще всё "
+                f"подходящее видео, особенно по популярным темам. Плюс даты в "
+                f"выдаче приблизительные («2 года назад», а не точный день).",
                 chat_id=chat_id, message_id=call.message.message_id, parse_mode='HTML')
             with _search_state_lock:
                 SEARCH_STATE[chat_id] = {'query': query}
@@ -3880,6 +5483,9 @@ def handle_quality_choice(call):
             return
 
         if choice.startswith('search_pick_'):
+            if rate_limited(chat_id):
+                safe_answer_callback(call, "🚦 Слишком много запросов подряд, подождите немного.")
+                return
             idx = int(choice.split('_')[-1])
             items = data.get('items') or []
             if idx >= len(items):
@@ -3891,6 +5497,14 @@ def handle_quality_choice(call):
                 bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
             except Exception:
                 pass
+            # Публикуем саму ссылку обычным сообщением — не только ради вида:
+            # если дальше что-то пойдёт не так (бот упадёт, потеряет
+            # состояние и т.п.), у вас всё равно останется настоящая
+            # рабочая ссылка в истории чата, а не просто мёртвая кнопка.
+            try:
+                bot.send_message(chat_id, picked_url)
+            except Exception as e:
+                logger.warning("Не удалось отправить ссылку выбранного видео: %s", e)
             job_key = ('url', chat_id, picked_url)
             if not try_start_job(job_key):
                 safe_answer_callback(call, "⏳ Уже обрабатывается, подождите.")
@@ -3900,14 +5514,17 @@ def handle_quality_choice(call):
                     process_url_message(m, u, call.message)
                 finally:
                     finish_job(job_key)
-            if not enqueue_job(_run):
+            if not enqueue_job(_run, owner=uid_of(call)):
                 finish_job(job_key)
-                safe_answer_callback(call, "🚦 Бот перегружен, попробуйте позже.", show_alert=True)
+                safe_answer_callback(call, "🚦 Бот перегружен или у вас уже запущено максимум "
+                                           "задач. Попробуйте позже.", show_alert=True)
             return
 
     data = user_data.get((call.message.chat.id, call.message.message_id))
     if not data:
         bot.answer_callback_query(call.id, "❌ Данные устарели, отправьте ссылку заново.")
+        return
+    if owner_denied(call, data):
         return
 
     video_id = data.get('video_id')
@@ -3933,9 +5550,10 @@ def handle_quality_choice(call):
                 resolve_sniff_pick(chat_id, cu, all_candidates=cands_, orig_url=orig_)
             finally:
                 finish_job(job_key)
-        if not enqueue_job(_run_pick):
+        if not enqueue_job(_run_pick, owner=uid_of(call)):
             finish_job(job_key)
-            safe_answer_callback(call, "🚦 Бот перегружен, попробуйте позже.", show_alert=True)
+            safe_answer_callback(call, "🚦 Бот перегружен или у вас уже запущено максимум "
+                                       "задач. Попробуйте позже.", show_alert=True)
         return
 
     if choice == 'sniff_back':
@@ -4107,7 +5725,7 @@ def send_full_description(chat_id, data, video_id=None, title=None, url=None):
     video_id = video_id or data.get('video_id') or 'video'
     title = title or data.get('title') or ''
     url = url or data.get('url') or ''
-    desc_path = os.path.join(DOWNLOAD_DIR, f"{video_id}_description.txt")
+    desc_path = os.path.join(DOWNLOAD_DIR, f"{_safe_id(video_id)}_description.txt")
     try:
         with open(desc_path, 'w', encoding='utf-8') as df:
             df.write(f"Название: {title}\nСсылка: {url}\n")
@@ -4139,11 +5757,13 @@ def process_main_download(call, data, choice, lang=None):
     try:
         cleanup_base(base_path_for(title, video_id))
         try:
-            with yt_dlp.YoutubeDL(get_download_options(choice, video_id, title, lang,
-                                                        reporter=reporter)) as ydl:
+            with make_ydl(get_download_options(choice, video_id, title, lang,
+                                               reporter=reporter), url) as ydl:
                 ydl.extract_info(url, download=True)
             filename = find_downloaded_file(base_path_for(title, video_id))
             used_quality = choice
+        except _FATAL_ERRORS:
+            raise
         except Exception:
             bot.edit_message_text("⚠️ Выбранное качество не скачалось, пробую другие...",
                                   chat_id=chat_id, message_id=status_msg.message_id)
@@ -4161,7 +5781,12 @@ def process_main_download(call, data, choice, lang=None):
             quality_text += f" | Дорожка: {lang_display(lang)}"
         cap = build_final_caption(data, file_size, quality_text)
 
-        file_type = 'audio' if used_quality.startswith('audio_') else 'video'
+        real_ext = os.path.splitext(filename)[1].lstrip('.').lower()
+        is_audio_file = used_quality.startswith('audio_') or real_ext in AUDIO_EXTS
+        file_type = 'audio' if is_audio_file else 'video'
+        if is_audio_file and not used_quality.startswith('audio_'):
+            # yt-dlp отдал только звук (например, фото-пост TikTok без видео)
+            cap = build_final_caption(data, file_size, "Только аудио (у поста нет видео)")
         sent = None
         result_kb = None
         # Если фолбэк подставил другое качество, чем было нажато (например
@@ -4216,7 +5841,7 @@ def process_main_download(call, data, choice, lang=None):
     except Exception as e:
         logger.error("Ошибка: %s", e)
         clean_err = re.sub(r'\x1b\[[0-9;]*m', '', str(e))
-        bot.send_message(chat_id, f"❌ Ошибка: {clean_err}")
+        bot.send_message(chat_id, f"❌ Ошибка: {public_error(clean_err)}")
     finally:
         if thumb_path and os.path.exists(thumb_path):
             os.remove(thumb_path)
@@ -4277,32 +5902,47 @@ def handle_period_reply_only(message):
         return
     if d_from > d_to:
         d_from, d_to = d_to, d_from
+    if _search_limiter.hit(uid_of(message) or chat_id):
+        with _search_state_lock:
+            SEARCH_STATE[chat_id] = pending   # не теряем запрос
+        bot.reply_to(message, "🚦 Слишком много поисковых запросов, подождите минуту и "
+                              "напишите период ещё раз.")
+        return
     query = pending['query']
     remember_search(chat_id, query)
+    # Показываем человеку, ЧТО именно ищем (в т.ч. подмешанные годы вроде
+    # "roblox 2012") — иначе он будет упорно вводить один и тот же
+    # исходный запрос, не понимая, почему результат каждый раз разный.
+    years = list(range(d_from.year, d_to.year + 1))
+    query_hint = ', '.join(f'«{query} {y}»' for y in years[:6])
+    if len(years) > 6:
+        query_hint += '…'
     status = bot.reply_to(
         message,
         f"⏳ Ищу «{esc(query)}» за период {d_from.strftime('%d.%m.%Y')}–"
-        f"{d_to.strftime('%d.%m.%Y')}...\n(проверяю даты видео по одному, "
-        f"может занять до минуты)", parse_mode='HTML')
+        f"{d_to.strftime('%d.%m.%Y')}...\n"
+        f"(проверяю по подзапросам: {esc(query_hint)}, плюс сам «{esc(query)}» "
+        f"— это может занять до минуты)", parse_mode='HTML')
 
     def _run(q=query, df=d_from, dt=d_to, mid=status.message_id):
         try:
-            items = yt_search_with_period(q, df, dt)
+            items, _ = yt_search_with_period(q, df, dt)
             note = None
             if not items:
-                note = ("(проверено ограниченное число видео из выдачи — "
-                        "попробуйте более широкий период или другой запрос)")
+                note = ("(ничего не нашлось в этом периоде — попробуйте "
+                        "более широкий период или другой запрос)")
             send_search_results(chat_id, q, items, message_id=mid, note=note)
         except Exception as e:
             logger.error("Ошибка поиска с периодом: %s", e)
             try:
-                bot.edit_message_text(f"❌ Ошибка поиска: {e}",
+                bot.edit_message_text(f"❌ Ошибка поиска: {public_error(e)}",
                                       chat_id=chat_id, message_id=mid)
             except Exception:
                 pass
-    if not enqueue_job(_run):
+    if not enqueue_job(_run, owner=uid_of(message)):
         try:
-            bot.edit_message_text("🚦 Бот перегружен, попробуйте позже.",
+            bot.edit_message_text("🚦 Бот перегружен или у вас уже запущено максимум задач. "
+                                  "Попробуйте позже.",
                                   chat_id=chat_id, message_id=status.message_id)
         except Exception:
             pass
@@ -4332,6 +5972,10 @@ def cleanup_stray_temp_files():
 # ---------- ЗАПУСК ----------
 if __name__ == '__main__':
     cleanup_stray_temp_files()
+    logger.info("yt-dlp %s", getattr(getattr(yt_dlp, 'version', None), '__version__', '?'))
+    if INSECURE_TLS:
+        logger.warning("INSECURE_TLS=1: проверка TLS-сертификатов ОТКЛЮЧЕНА — трафик к "
+                       "сайтам и сторонним API (tikwm/cobalt) можно подменить по пути.")
     load_sent_cache()
     load_search_history()
     try:
